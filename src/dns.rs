@@ -131,10 +131,179 @@ pub fn forward_query(query: &[u8]) -> Option<Vec<u8>> {
     let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .ok()?;
-    // Use Google DNS as fallback; ideally we'd read /etc/resolv.conf from the host
-    // before entering the namespace, but this works for now.
     sock.send_to(query, "8.8.8.8:53").ok()?;
     let mut buf = [0u8; 4096];
     let (len, _) = sock.recv_from(&mut buf).ok()?;
     Some(buf[..len].to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal DNS query for a given domain.
+    fn make_query(domain: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Header: ID=0x1234, flags=0x0100 (RD), QDCOUNT=1
+        buf.extend_from_slice(&[
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]);
+        // QNAME
+        for label in domain.split('.') {
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label.as_bytes());
+        }
+        buf.push(0); // root label
+        // QTYPE=A (1), QCLASS=IN (1)
+        buf.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        buf
+    }
+
+    /// Build a DNS response with A records for a given query.
+    fn make_response(query: &[u8], ips: &[Ipv4Addr]) -> Vec<u8> {
+        let mut buf = query.to_vec();
+        // Set QR=1
+        buf[2] |= 0x80;
+        // ANCOUNT
+        let ancount = ips.len() as u16;
+        buf[6..8].copy_from_slice(&ancount.to_be_bytes());
+
+        for ip in ips {
+            // NAME: pointer to offset 12 (the QNAME in the query)
+            buf.extend_from_slice(&[0xC0, 0x0C]);
+            // TYPE=A (1)
+            buf.extend_from_slice(&[0x00, 0x01]);
+            // CLASS=IN (1)
+            buf.extend_from_slice(&[0x00, 0x01]);
+            // TTL=300
+            buf.extend_from_slice(&[0x00, 0x00, 0x01, 0x2c]);
+            // RDLENGTH=4
+            buf.extend_from_slice(&[0x00, 0x04]);
+            // RDATA
+            buf.extend_from_slice(&ip.octets());
+        }
+        buf
+    }
+
+    #[test]
+    fn parse_query_simple() {
+        let query = make_query("example.com");
+        assert_eq!(parse_query_domain(&query), Some("example.com".into()));
+    }
+
+    #[test]
+    fn parse_query_subdomain() {
+        let query = make_query("sub.deep.example.com");
+        assert_eq!(
+            parse_query_domain(&query),
+            Some("sub.deep.example.com".into())
+        );
+    }
+
+    #[test]
+    fn parse_query_single_label() {
+        let query = make_query("localhost");
+        assert_eq!(parse_query_domain(&query), Some("localhost".into()));
+    }
+
+    #[test]
+    fn parse_query_too_short() {
+        assert_eq!(parse_query_domain(&[0; 11]), None);
+        assert_eq!(parse_query_domain(&[]), None);
+    }
+
+    #[test]
+    fn parse_query_zero_qdcount() {
+        // Valid header but QDCOUNT=0
+        let mut query = make_query("example.com");
+        query[4] = 0;
+        query[5] = 0;
+        assert_eq!(parse_query_domain(&query), None);
+    }
+
+    #[test]
+    fn parse_query_truncated_label() {
+        let mut query = make_query("example.com");
+        // Truncate in the middle of a label
+        query.truncate(15);
+        assert_eq!(parse_query_domain(&query), None);
+    }
+
+    #[test]
+    fn nxdomain_response_has_correct_flags() {
+        let query = make_query("blocked.com");
+        let response = build_nxdomain_response(&query).unwrap();
+
+        // Same length as query (no answer section)
+        assert_eq!(response.len(), query.len());
+        // QR bit set
+        assert_ne!(response[2] & 0x80, 0);
+        // RCODE=3 (NXDOMAIN)
+        assert_eq!(response[3] & 0x0F, 3);
+        // ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+        assert_eq!(&response[6..12], &[0, 0, 0, 0, 0, 0]);
+        // Transaction ID preserved
+        assert_eq!(&response[0..2], &query[0..2]);
+    }
+
+    #[test]
+    fn nxdomain_rejects_short_input() {
+        assert!(build_nxdomain_response(&[0; 11]).is_none());
+    }
+
+    #[test]
+    fn extract_a_records_single() {
+        let query = make_query("example.com");
+        let response = make_response(&query, &[Ipv4Addr::new(93, 184, 216, 34)]);
+        let ips = extract_a_records(&response);
+        assert_eq!(ips, vec![Ipv4Addr::new(93, 184, 216, 34)]);
+    }
+
+    #[test]
+    fn extract_a_records_multiple() {
+        let query = make_query("example.com");
+        let addrs = vec![Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8)];
+        let response = make_response(&query, &addrs);
+        let ips = extract_a_records(&response);
+        assert_eq!(ips, addrs);
+    }
+
+    #[test]
+    fn extract_a_records_no_answers() {
+        let query = make_query("example.com");
+        // Response with ANCOUNT=0
+        let mut response = query.clone();
+        response[2] |= 0x80;
+        assert!(extract_a_records(&response).is_empty());
+    }
+
+    #[test]
+    fn extract_a_records_empty_input() {
+        assert!(extract_a_records(&[]).is_empty());
+        assert!(extract_a_records(&[0; 11]).is_empty());
+    }
+
+    #[test]
+    fn extract_a_records_skips_non_a_records() {
+        let query = make_query("example.com");
+        let mut response = query.clone();
+        response[2] |= 0x80;
+        // ANCOUNT=1
+        response[6] = 0;
+        response[7] = 1;
+        // NAME pointer
+        response.extend_from_slice(&[0xC0, 0x0C]);
+        // TYPE=AAAA (28) instead of A
+        response.extend_from_slice(&[0x00, 0x1C]);
+        // CLASS=IN
+        response.extend_from_slice(&[0x00, 0x01]);
+        // TTL
+        response.extend_from_slice(&[0x00, 0x00, 0x00, 0x3c]);
+        // RDLENGTH=16 (IPv6)
+        response.extend_from_slice(&[0x00, 0x10]);
+        // 16 bytes of IPv6 data
+        response.extend_from_slice(&[0; 16]);
+
+        assert!(extract_a_records(&response).is_empty());
+    }
 }
