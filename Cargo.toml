@@ -4,3 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+libc = "0.2"
+
+[dependencies.smoltcp]
+version = "0.12"
+default-features = false
+features = [
+    "std",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+    "socket-raw",
+]

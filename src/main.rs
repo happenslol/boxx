@@ -1,28 +1,198 @@
+mod dns;
+mod netns;
+mod proxy;
+mod whitelist;
+
 use std::process::Command;
+use whitelist::{AllowEntry, Whitelist, parse_allow_entry};
+
+enum NetworkMode {
+    /// No network access at all (no --allow flags).
+    Isolated,
+    /// Filtered through whitelist.
+    Filtered(Vec<AllowEntry>),
+    /// Full passthrough (--allow-all).
+    Passthrough,
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("usage: boxx <command> [args...]");
+        eprintln!("usage: boxx [--allow <domain|ip|cidr>]... [--allow-all] -- <command> [args...]");
+        std::process::exit(1);
+    }
+
+    let (net_mode, cmd_args) = parse_args(&args);
+    if cmd_args.is_empty() {
+        eprintln!("usage: boxx [--allow <domain|ip|cidr>]... [--allow-all] -- <command> [args...]");
         std::process::exit(1);
     }
 
     let home = std::env::var("HOME").expect("HOME not set");
     let tmp_dir = format!("/tmp/boxx-{:016x}", random_u64());
-
     std::fs::create_dir_all(&tmp_dir).expect("failed to create tmp dir");
 
+    let exit_code = match net_mode {
+        NetworkMode::Passthrough => run_passthrough(&home, &tmp_dir, &cmd_args),
+        NetworkMode::Isolated => run_isolated(&home, &tmp_dir, &cmd_args),
+        NetworkMode::Filtered(entries) => run_filtered(&home, &tmp_dir, &cmd_args, entries),
+    };
+
+    std::fs::remove_dir_all(&tmp_dir).ok();
+    std::process::exit(exit_code);
+}
+
+fn parse_args(args: &[String]) -> (NetworkMode, Vec<String>) {
+    let mut allow_entries = Vec::new();
+    let mut allow_all = false;
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--allow-all" => {
+                allow_all = true;
+                i += 1;
+            }
+            "--allow" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("--allow requires an argument");
+                    std::process::exit(1);
+                }
+                allow_entries.push(parse_allow_entry(&args[i]));
+                i += 1;
+            }
+            "--" => {
+                i += 1;
+                break;
+            }
+            _ => break,
+        }
+    }
+
+    let cmd_args = args[i..].to_vec();
+
+    let mode = if allow_all {
+        NetworkMode::Passthrough
+    } else if allow_entries.is_empty() {
+        NetworkMode::Isolated
+    } else {
+        NetworkMode::Filtered(allow_entries)
+    };
+
+    (mode, cmd_args)
+}
+
+/// Run with full network access (current behavior).
+fn run_passthrough(home: &str, tmp_dir: &str, args: &[String]) -> i32 {
+    let mut cmd = build_bwrap_cmd(home, tmp_dir, BwrapNetMode::Passthrough);
+    cmd.args(args);
+    exec_bwrap(cmd)
+}
+
+/// Run with no network access at all.
+fn run_isolated(home: &str, tmp_dir: &str, args: &[String]) -> i32 {
+    let mut cmd = build_bwrap_cmd(home, tmp_dir, BwrapNetMode::Isolated);
+    cmd.args(args);
+    exec_bwrap(cmd)
+}
+
+/// Run with filtered network through the proxy.
+fn run_filtered(home: &str, tmp_dir: &str, args: &[String], entries: Vec<AllowEntry>) -> i32 {
+    let mut whitelist = Whitelist::new(entries);
+
+    // Write a resolv.conf that points DNS to our proxy gateway
+    let resolv_path = format!("{tmp_dir}/resolv.conf");
+    std::fs::write(&resolv_path, "nameserver 10.0.2.2\n").expect("failed to write resolv.conf");
+
+    // Resolve the real path behind /etc/resolv.conf (follows symlinks)
+    // so we can overlay the actual file, not the symlink.
+    let resolv_target = std::fs::canonicalize("/etc/resolv.conf")
+        .unwrap_or_else(|_| std::path::PathBuf::from("/etc/resolv.conf"));
+    let resolv_target_str = resolv_target
+        .to_str()
+        .expect("resolv.conf path not utf-8")
+        .to_string();
+
+    // Clone values needed by the child closure
+    let home_clone = home.to_string();
+    let tmp_dir_clone = tmp_dir.to_string();
+    let resolv_clone = resolv_path.clone();
+    let args_clone = args.to_vec();
+
+    let sandbox = netns::setup_sandbox_netns_with_child(move || {
+        // This runs in the child process, inside the new user+net namespace.
+        // Use Filtered mode: skip user/net unshare since we already did that.
+        let mut cmd = build_bwrap_cmd(&home_clone, &tmp_dir_clone, BwrapNetMode::Filtered);
+
+        // Override the real resolv.conf file (following symlinks)
+        cmd.args(["--ro-bind", &resolv_clone, &resolv_target_str]);
+
+        cmd.args(&args_clone);
+
+        let err = exec_bwrap_replace(cmd);
+        eprintln!("failed to exec bwrap: {err}");
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("failed to set up sandbox network: {e}");
+        std::process::exit(1);
+    });
+
+    // Signal the child to start (TAP device is set up, proxy is about to run)
+    unsafe {
+        libc::write(sandbox.ready_fd, [1u8].as_ptr().cast(), 1);
+        libc::close(sandbox.ready_fd);
+    }
+
+    // Run the proxy loop (blocks until child exits)
+    proxy::run_proxy(sandbox.tap_fd, &mut whitelist, sandbox.child_pid);
+
+    // Collect child exit status
+    let mut status = 0i32;
+    unsafe { libc::waitpid(sandbox.child_pid, &mut status, 0) };
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        1
+    }
+}
+
+enum BwrapNetMode {
+    /// Full passthrough: --unshare-all --share-net
+    Passthrough,
+    /// Isolated: --unshare-all (network unshared by bwrap)
+    Isolated,
+    /// Filtered: already in user+net namespace, only unshare ipc/pid/uts/cgroup
+    Filtered,
+}
+
+fn build_bwrap_cmd(home: &str, tmp_dir: &str, net_mode: BwrapNetMode) -> Command {
     let mut cmd = Command::new("bwrap");
 
-    // Unshare all namespaces
-    cmd.args(["--unshare-all", "--share-net"]);
+    match net_mode {
+        BwrapNetMode::Passthrough => {
+            cmd.args(["--unshare-all", "--share-net"]);
+        }
+        BwrapNetMode::Isolated => {
+            cmd.args(["--unshare-all"]);
+        }
+        BwrapNetMode::Filtered => {
+            // Already in a user+net namespace; only unshare the rest
+            cmd.args([
+                "--unshare-ipc",
+                "--unshare-pid",
+                "--unshare-uts",
+                "--unshare-cgroup",
+            ]);
+        }
+    }
 
     // Basic filesystem setup
     cmd.args(["--dev", "/dev"]);
     cmd.args(["--proc", "/proc"]);
 
     // Per-sandbox tmp directory
-    cmd.args(["--bind", &tmp_dir, "/tmp"]);
+    cmd.args(["--bind", tmp_dir, "/tmp"]);
 
     // System paths (read-only)
     for path in ["/nix/store", "/run", "/etc"] {
@@ -63,16 +233,22 @@ fn main() {
         cmd.args(["--chdir", cwd]);
     }
 
-    // The sandboxed command
-    cmd.args(&args);
+    cmd
+}
 
+fn exec_bwrap(mut cmd: Command) -> i32 {
     let status = cmd.status().unwrap_or_else(|e| {
         eprintln!("failed to exec bwrap: {e}");
         std::process::exit(1);
     });
+    status.code().unwrap_or(1)
+}
 
-    std::fs::remove_dir_all(&tmp_dir).ok();
-    std::process::exit(status.code().unwrap_or(1));
+/// Replace the current process with bwrap (used in the child after fork).
+fn exec_bwrap_replace(mut cmd: Command) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    // This only returns if exec fails
+    cmd.exec()
 }
 
 fn random_u64() -> u64 {
