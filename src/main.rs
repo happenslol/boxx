@@ -3,84 +3,46 @@ mod netns;
 mod proxy;
 mod whitelist;
 
+use clap::Parser;
 use std::process::Command;
 use whitelist::{AllowEntry, Whitelist, parse_allow_entry};
 
-enum NetworkMode {
-    /// No network access at all (no --allow flags).
-    Isolated,
-    /// Filtered through whitelist.
-    Filtered(Vec<AllowEntry>),
-    /// Full passthrough (--allow-all).
-    Passthrough,
+/// Lightweight sandbox for running commands with filesystem and network isolation.
+#[derive(Parser)]
+#[command(name = "boxx")]
+struct Cli {
+    /// Allow network access to a domain, IP, or CIDR (can be repeated).
+    #[arg(long = "allow", value_name = "DOMAIN|IP|CIDR")]
+    allow: Vec<String>,
+
+    /// Allow unrestricted network access (passthrough).
+    #[arg(long = "allow-all")]
+    allow_all: bool,
+
+    /// Command to run inside the sandbox.
+    #[arg(required = true, trailing_var_arg = true)]
+    command: Vec<String>,
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
-        eprintln!("usage: boxx [--allow <domain|ip|cidr>]... [--allow-all] -- <command> [args...]");
-        std::process::exit(1);
-    }
+    let cli = Cli::parse();
 
-    let (net_mode, cmd_args) = parse_args(&args);
-    if cmd_args.is_empty() {
-        eprintln!("usage: boxx [--allow <domain|ip|cidr>]... [--allow-all] -- <command> [args...]");
-        std::process::exit(1);
-    }
+    let allow_entries: Vec<AllowEntry> = cli.allow.iter().map(|s| parse_allow_entry(s)).collect();
 
     let home = std::env::var("HOME").expect("HOME not set");
     let tmp_dir = format!("/tmp/boxx-{:016x}", random_u64());
     std::fs::create_dir_all(&tmp_dir).expect("failed to create tmp dir");
 
-    let exit_code = match net_mode {
-        NetworkMode::Passthrough => run_passthrough(&home, &tmp_dir, &cmd_args),
-        NetworkMode::Isolated => run_isolated(&home, &tmp_dir, &cmd_args),
-        NetworkMode::Filtered(entries) => run_filtered(&home, &tmp_dir, &cmd_args, entries),
+    let exit_code = if cli.allow_all {
+        run_passthrough(&home, &tmp_dir, &cli.command)
+    } else if allow_entries.is_empty() {
+        run_isolated(&home, &tmp_dir, &cli.command)
+    } else {
+        run_filtered(&home, &tmp_dir, &cli.command, allow_entries)
     };
 
     std::fs::remove_dir_all(&tmp_dir).ok();
     std::process::exit(exit_code);
-}
-
-fn parse_args(args: &[String]) -> (NetworkMode, Vec<String>) {
-    let mut allow_entries = Vec::new();
-    let mut allow_all = false;
-    let mut i = 0;
-
-    while i < args.len() {
-        match args[i].as_str() {
-            "--allow-all" => {
-                allow_all = true;
-                i += 1;
-            }
-            "--allow" => {
-                i += 1;
-                if i >= args.len() {
-                    eprintln!("--allow requires an argument");
-                    std::process::exit(1);
-                }
-                allow_entries.push(parse_allow_entry(&args[i]));
-                i += 1;
-            }
-            "--" => {
-                i += 1;
-                break;
-            }
-            _ => break,
-        }
-    }
-
-    let cmd_args = args[i..].to_vec();
-
-    let mode = if allow_all {
-        NetworkMode::Passthrough
-    } else if allow_entries.is_empty() {
-        NetworkMode::Isolated
-    } else {
-        NetworkMode::Filtered(allow_entries)
-    };
-
-    (mode, cmd_args)
 }
 
 /// Run with full network access (current behavior).
