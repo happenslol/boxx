@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpStream};
 use std::os::fd::RawFd;
 use std::sync::mpsc;
 use std::time::SystemTime;
@@ -9,12 +9,13 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
 
 use crate::dns;
 use crate::whitelist::Whitelist;
 
-const GATEWAY_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
+const GATEWAY_IPV4: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
+const GATEWAY_IPV6: Ipv6Address = Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
 const GATEWAY_MAC: EthernetAddress = EthernetAddress([0x52, 0x55, 0x0a, 0x00, 0x02, 0x02]);
 const MTU: usize = 1500;
 
@@ -105,15 +106,12 @@ struct TcpBridge {
 }
 
 impl TcpBridge {
-    fn new(dst_ip: Ipv4Addr, dst_port: u16) -> Self {
+    fn new(dst_ip: IpAddr, dst_port: u16) -> Self {
         // Start connecting to the host in a background thread (non-blocking)
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let addr = SocketAddrV4::new(dst_ip, dst_port);
-            let result = TcpStream::connect_timeout(
-                &std::net::SocketAddr::V4(addr),
-                std::time::Duration::from_secs(10),
-            );
+            let addr = SocketAddr::new(dst_ip, dst_port);
+            let result = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(10));
             tx.send(result).ok();
         });
         TcpBridge {
@@ -146,32 +144,57 @@ impl TcpBridge {
     }
 }
 
-/// Extract destination IP and port from a TCP SYN in an Ethernet frame.
-fn extract_tcp_syn(frame: &[u8]) -> Option<(Ipv4Addr, u16)> {
-    // Ethernet header: 14 bytes
+/// Extract destination IP and port from a TCP SYN in an Ethernet frame (IPv4 or IPv6).
+fn extract_tcp_syn(frame: &[u8]) -> Option<(IpAddr, u16)> {
     if frame.len() < 14 {
         return None;
     }
-    // Check ethertype = IPv4 (0x0800)
-    if frame[12] != 0x08 || frame[13] != 0x00 {
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    let ip_payload = &frame[14..];
+
+    let (dst_ip, tcp_offset) = match ethertype {
+        0x0800 => {
+            // IPv4
+            if ip_payload.len() < 20 {
+                return None;
+            }
+            let version = ip_payload[0] >> 4;
+            let ihl = (ip_payload[0] & 0x0f) as usize * 4;
+            let protocol = ip_payload[9];
+            if version != 4 || protocol != 6 {
+                return None;
+            }
+            let dst = IpAddr::V4(std::net::Ipv4Addr::new(
+                ip_payload[16],
+                ip_payload[17],
+                ip_payload[18],
+                ip_payload[19],
+            ));
+            (dst, ihl)
+        }
+        0x86dd => {
+            // IPv6
+            if ip_payload.len() < 40 {
+                return None;
+            }
+            let version = ip_payload[0] >> 4;
+            let next_header = ip_payload[6];
+            if version != 6 || next_header != 6 {
+                // next_header 6 = TCP; we don't chase extension headers
+                return None;
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&ip_payload[24..40]); // dst addr
+            let dst = IpAddr::V6(Ipv6Addr::from(octets));
+            (dst, 40) // fixed 40-byte IPv6 header
+        }
+        _ => return None,
+    };
+
+    let tcp = &ip_payload[tcp_offset..];
+    if tcp.len() < 20 {
         return None;
     }
-    let ip = &frame[14..];
-    if ip.len() < 20 {
-        return None;
-    }
-    // Check IPv4 and protocol = TCP (6)
-    let version = ip[0] >> 4;
-    let ihl = (ip[0] & 0x0f) as usize * 4;
-    let protocol = ip[9];
-    if version != 4 || protocol != 6 {
-        return None;
-    }
-    if ip.len() < ihl + 20 {
-        return None;
-    }
-    let dst_ip = Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]);
-    let tcp = &ip[ihl..];
     let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
     let flags = tcp[13];
     let syn = flags & 0x02 != 0;
@@ -198,12 +221,17 @@ pub fn run_proxy(tap_fd: RawFd, whitelist: &mut Whitelist, child_pid: i32) {
     let mut iface = Interface::new(config, &mut device, now());
     iface.set_any_ip(true);
     iface.update_ip_addrs(|addrs| {
-        addrs.push(IpCidr::new(GATEWAY_IP.into(), 24)).unwrap();
+        addrs.push(IpCidr::new(GATEWAY_IPV4.into(), 24)).unwrap();
+        addrs.push(IpCidr::new(GATEWAY_IPV6.into(), 64)).unwrap();
     });
-    // Add a default route so smoltcp accepts packets to any IP
+    // Add default routes so smoltcp accepts packets to any IP
     iface
         .routes_mut()
-        .add_default_ipv4_route(GATEWAY_IP)
+        .add_default_ipv4_route(GATEWAY_IPV4)
+        .unwrap();
+    iface
+        .routes_mut()
+        .add_default_ipv6_route(GATEWAY_IPV6)
         .unwrap();
 
     let mut sockets = SocketSet::new(vec![]);
@@ -364,7 +392,7 @@ fn handle_dns(
 
     if whitelist.is_domain_allowed(&domain) {
         if let Some(response) = dns::forward_query(data) {
-            for ip in dns::extract_a_records(&response) {
+            for ip in dns::extract_ip_records(&response) {
                 whitelist.add_resolved_ip(ip);
             }
             dns_socket.send_slice(&response, reply_meta).ok();
@@ -377,102 +405,162 @@ fn handle_dns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
-    /// Build a minimal Ethernet + IPv4 + TCP SYN frame.
-    fn make_tcp_syn(dst_ip: [u8; 4], dst_port: u16) -> Vec<u8> {
+    fn make_tcp_syn_v4(dst_ip: [u8; 4], dst_port: u16) -> Vec<u8> {
         let mut frame = Vec::new();
-        // Ethernet header (14 bytes)
         frame.extend_from_slice(&[0xff; 6]); // dst mac
         frame.extend_from_slice(&[0x00; 6]); // src mac
-        frame.extend_from_slice(&[0x08, 0x00]); // ethertype = IPv4
+        frame.extend_from_slice(&[0x08, 0x00]); // IPv4
 
-        // IPv4 header (20 bytes)
         frame.push(0x45); // version=4, ihl=5
-        frame.push(0x00); // DSCP/ECN
-        let total_len: u16 = 40; // 20 IP + 20 TCP
-        frame.extend_from_slice(&total_len.to_be_bytes());
-        frame.extend_from_slice(&[0x00; 4]); // ID, flags, frag offset
-        frame.push(64); // TTL
-        frame.push(6); // protocol = TCP
-        frame.extend_from_slice(&[0x00, 0x00]); // checksum (skipped)
-        frame.extend_from_slice(&[10, 0, 2, 15]); // src IP
-        frame.extend_from_slice(&dst_ip); // dst IP
+        frame.push(0x00);
+        frame.extend_from_slice(&40u16.to_be_bytes());
+        frame.extend_from_slice(&[0x00; 4]);
+        frame.push(64);
+        frame.push(6); // TCP
+        frame.extend_from_slice(&[0x00, 0x00]);
+        frame.extend_from_slice(&[10, 0, 2, 15]);
+        frame.extend_from_slice(&dst_ip);
 
-        // TCP header (20 bytes)
-        frame.extend_from_slice(&12345u16.to_be_bytes()); // src port
-        frame.extend_from_slice(&dst_port.to_be_bytes()); // dst port
-        frame.extend_from_slice(&[0x00; 4]); // seq number
-        frame.extend_from_slice(&[0x00; 4]); // ack number
-        frame.push(0x50); // data offset = 5 (20 bytes), no flags high nibble
-        frame.push(0x02); // flags: SYN only
-        frame.extend_from_slice(&[0xff, 0xff]); // window
-        frame.extend_from_slice(&[0x00; 4]); // checksum + urgent
-
+        append_tcp_syn_header(&mut frame, dst_port);
         frame
     }
 
-    #[test]
-    fn extract_syn_valid() {
-        let frame = make_tcp_syn([93, 184, 216, 34], 443);
-        let result = extract_tcp_syn(&frame);
-        assert_eq!(result, Some((Ipv4Addr::new(93, 184, 216, 34), 443)));
+    fn make_tcp_syn_v6(dst_ip: Ipv6Addr, dst_port: u16) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0xff; 6]); // dst mac
+        frame.extend_from_slice(&[0x00; 6]); // src mac
+        frame.extend_from_slice(&[0x86, 0xdd]); // IPv6
+
+        // IPv6 header (40 bytes)
+        frame.push(0x60); // version=6
+        frame.extend_from_slice(&[0x00; 3]); // traffic class + flow label
+        frame.extend_from_slice(&20u16.to_be_bytes()); // payload length = TCP header
+        frame.push(6); // next header = TCP
+        frame.push(64); // hop limit
+        frame.extend_from_slice(&Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 0x15).octets()); // src
+        frame.extend_from_slice(&dst_ip.octets()); // dst
+
+        append_tcp_syn_header(&mut frame, dst_port);
+        frame
     }
 
+    fn append_tcp_syn_header(frame: &mut Vec<u8>, dst_port: u16) {
+        frame.extend_from_slice(&12345u16.to_be_bytes()); // src port
+        frame.extend_from_slice(&dst_port.to_be_bytes());
+        frame.extend_from_slice(&[0x00; 4]); // seq
+        frame.extend_from_slice(&[0x00; 4]); // ack
+        frame.push(0x50); // data offset = 5
+        frame.push(0x02); // SYN
+        frame.extend_from_slice(&[0xff, 0xff]); // window
+        frame.extend_from_slice(&[0x00; 4]); // checksum + urgent
+    }
+
+    // -- IPv4 SYN extraction --
+
     #[test]
-    fn extract_syn_different_port() {
-        let frame = make_tcp_syn([1, 2, 3, 4], 8080);
+    fn extract_syn_v4() {
+        let frame = make_tcp_syn_v4([93, 184, 216, 34], 443);
         assert_eq!(
             extract_tcp_syn(&frame),
-            Some((Ipv4Addr::new(1, 2, 3, 4), 8080))
+            Some((IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 443))
         );
     }
 
     #[test]
-    fn extract_syn_ignores_syn_ack() {
-        let mut frame = make_tcp_syn([1, 2, 3, 4], 80);
-        // Set ACK flag (byte 47 = offset 14+20+13 in the TCP header)
+    fn extract_syn_v4_different_port() {
+        let frame = make_tcp_syn_v4([1, 2, 3, 4], 8080);
+        assert_eq!(
+            extract_tcp_syn(&frame),
+            Some((IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8080))
+        );
+    }
+
+    #[test]
+    fn extract_syn_v4_ignores_syn_ack() {
+        let mut frame = make_tcp_syn_v4([1, 2, 3, 4], 80);
         frame[14 + 20 + 13] = 0x12; // SYN+ACK
         assert_eq!(extract_tcp_syn(&frame), None);
     }
 
     #[test]
-    fn extract_syn_ignores_ack_only() {
-        let mut frame = make_tcp_syn([1, 2, 3, 4], 80);
-        frame[14 + 20 + 13] = 0x10; // ACK only, no SYN
+    fn extract_syn_v4_ignores_ack() {
+        let mut frame = make_tcp_syn_v4([1, 2, 3, 4], 80);
+        frame[14 + 20 + 13] = 0x10;
         assert_eq!(extract_tcp_syn(&frame), None);
     }
 
     #[test]
-    fn extract_syn_ignores_rst() {
-        let mut frame = make_tcp_syn([1, 2, 3, 4], 80);
-        frame[14 + 20 + 13] = 0x04; // RST
+    fn extract_syn_v4_ignores_udp() {
+        let mut frame = make_tcp_syn_v4([1, 2, 3, 4], 53);
+        frame[14 + 9] = 17; // UDP
         assert_eq!(extract_tcp_syn(&frame), None);
     }
 
     #[test]
-    fn extract_syn_ignores_udp() {
-        let mut frame = make_tcp_syn([1, 2, 3, 4], 53);
-        // Change protocol to UDP (17)
-        frame[14 + 9] = 17;
+    fn extract_syn_v4_with_ip_options() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0xff; 6]);
+        frame.extend_from_slice(&[0x00; 6]);
+        frame.extend_from_slice(&[0x08, 0x00]);
+        frame.push(0x46); // ihl=6 (24 bytes)
+        frame.push(0x00);
+        frame.extend_from_slice(&44u16.to_be_bytes());
+        frame.extend_from_slice(&[0x00; 4]);
+        frame.push(64);
+        frame.push(6);
+        frame.extend_from_slice(&[0x00, 0x00]);
+        frame.extend_from_slice(&[10, 0, 2, 15]);
+        frame.extend_from_slice(&[1, 2, 3, 4]);
+        frame.extend_from_slice(&[0x00; 4]); // IP options
+        append_tcp_syn_header(&mut frame, 443);
+
+        assert_eq!(
+            extract_tcp_syn(&frame),
+            Some((IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 443))
+        );
+    }
+
+    // -- IPv6 SYN extraction --
+
+    #[test]
+    fn extract_syn_v6() {
+        let dst: Ipv6Addr = "2606:4700::1".parse().unwrap();
+        let frame = make_tcp_syn_v6(dst, 443);
+        assert_eq!(extract_tcp_syn(&frame), Some((IpAddr::V6(dst), 443)));
+    }
+
+    #[test]
+    fn extract_syn_v6_different_port() {
+        let dst: Ipv6Addr = "::1".parse().unwrap();
+        let frame = make_tcp_syn_v6(dst, 8080);
+        assert_eq!(extract_tcp_syn(&frame), Some((IpAddr::V6(dst), 8080)));
+    }
+
+    #[test]
+    fn extract_syn_v6_ignores_syn_ack() {
+        let dst: Ipv6Addr = "::1".parse().unwrap();
+        let mut frame = make_tcp_syn_v6(dst, 80);
+        frame[14 + 40 + 13] = 0x12; // SYN+ACK
         assert_eq!(extract_tcp_syn(&frame), None);
     }
 
     #[test]
-    fn extract_syn_ignores_ipv6() {
-        let mut frame = make_tcp_syn([1, 2, 3, 4], 80);
-        // Change ethertype to IPv6
-        frame[12] = 0x86;
-        frame[13] = 0xdd;
+    fn extract_syn_v6_ignores_udp() {
+        let dst: Ipv6Addr = "::1".parse().unwrap();
+        let mut frame = make_tcp_syn_v6(dst, 53);
+        frame[14 + 6] = 17; // next_header = UDP
         assert_eq!(extract_tcp_syn(&frame), None);
     }
+
+    // -- Edge cases --
 
     #[test]
     fn extract_syn_ignores_arp() {
         let frame = vec![
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // dst mac
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // src mac
-            0x08, 0x06, // ethertype = ARP
-            0x00, 0x01, // rest of ARP (doesn't matter)
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x06,
+            0x00, 0x01,
         ];
         assert_eq!(extract_tcp_syn(&frame), None);
     }
@@ -480,49 +568,20 @@ mod tests {
     #[test]
     fn extract_syn_too_short() {
         assert_eq!(extract_tcp_syn(&[]), None);
-        assert_eq!(extract_tcp_syn(&[0; 13]), None); // too short for ethernet
-        assert_eq!(extract_tcp_syn(&[0; 14]), None); // ethernet but no IP
+        assert_eq!(extract_tcp_syn(&[0; 13]), None);
 
-        // Ethernet + partial IP header
+        // Short IPv4
         let mut short = vec![0u8; 14 + 10];
         short[12] = 0x08;
         short[13] = 0x00;
         short[14] = 0x45;
         assert_eq!(extract_tcp_syn(&short), None);
-    }
 
-    #[test]
-    fn extract_syn_with_ip_options() {
-        // IHL=6 (24 bytes IP header — includes 4 bytes of options)
-        let mut frame = Vec::new();
-        // Ethernet
-        frame.extend_from_slice(&[0xff; 6]);
-        frame.extend_from_slice(&[0x00; 6]);
-        frame.extend_from_slice(&[0x08, 0x00]);
-        // IPv4 with IHL=6
-        frame.push(0x46); // version=4, ihl=6
-        frame.push(0x00);
-        frame.extend_from_slice(&44u16.to_be_bytes()); // total_len = 24 IP + 20 TCP
-        frame.extend_from_slice(&[0x00; 4]);
-        frame.push(64); // TTL
-        frame.push(6); // TCP
-        frame.extend_from_slice(&[0x00, 0x00]); // checksum
-        frame.extend_from_slice(&[10, 0, 2, 15]); // src
-        frame.extend_from_slice(&[1, 2, 3, 4]); // dst
-        frame.extend_from_slice(&[0x00; 4]); // IP options (4 bytes)
-        // TCP header
-        frame.extend_from_slice(&5000u16.to_be_bytes()); // src port
-        frame.extend_from_slice(&443u16.to_be_bytes()); // dst port
-        frame.extend_from_slice(&[0x00; 4]); // seq
-        frame.extend_from_slice(&[0x00; 4]); // ack
-        frame.push(0x50); // data offset
-        frame.push(0x02); // SYN
-        frame.extend_from_slice(&[0xff, 0xff]); // window
-        frame.extend_from_slice(&[0x00; 4]); // checksum + urgent
-
-        assert_eq!(
-            extract_tcp_syn(&frame),
-            Some((Ipv4Addr::new(1, 2, 3, 4), 443))
-        );
+        // Short IPv6
+        let mut short6 = vec![0u8; 14 + 20];
+        short6[12] = 0x86;
+        short6[13] = 0xdd;
+        short6[14] = 0x60;
+        assert_eq!(extract_tcp_syn(&short6), None);
     }
 }

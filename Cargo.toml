@@ -13,6 +13,7 @@ features = [
     "std",
     "medium-ethernet",
     "proto-ipv4",
+    "proto-ipv6",
     "socket-tcp",
     "socket-udp",
     "socket-raw",

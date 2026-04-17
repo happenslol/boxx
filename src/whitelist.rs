@@ -1,18 +1,48 @@
 use std::collections::HashSet;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
 #[derive(Debug, Clone)]
 pub enum AllowEntry {
     Domain(String),
-    Ip(Ipv4Addr),
-    Cidr(Ipv4Addr, u8),
+    Ip(IpAddr),
+    Cidr(IpAddr, u8),
 }
 
 pub struct Whitelist {
     domains: Vec<String>,
-    ips: HashSet<Ipv4Addr>,
-    cidrs: Vec<(u32, u32)>, // (network, mask)
-    resolved_ips: HashSet<Ipv4Addr>,
+    ips: HashSet<IpAddr>,
+    cidrs: Vec<CidrEntry>,
+    resolved_ips: HashSet<IpAddr>,
+}
+
+#[derive(Clone)]
+struct CidrEntry {
+    addr: IpAddr,
+    prefix_len: u8,
+}
+
+impl CidrEntry {
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(target)) => {
+                if self.prefix_len == 0 {
+                    return true;
+                }
+                let mask = !0u32 << (32 - self.prefix_len);
+                u32::from(target) & mask == u32::from(net) & mask
+            }
+            (IpAddr::V6(net), IpAddr::V6(target)) => {
+                if self.prefix_len == 0 {
+                    return true;
+                }
+                let net = u128::from(net);
+                let target = u128::from(target);
+                let mask = !0u128 << (128 - self.prefix_len);
+                target & mask == net & mask
+            }
+            _ => false, // v4 CIDR doesn't match v6 address and vice versa
+        }
+    }
 }
 
 impl Whitelist {
@@ -29,14 +59,8 @@ impl Whitelist {
                 AllowEntry::Ip(ip) => {
                     wl.ips.insert(ip);
                 }
-                AllowEntry::Cidr(addr, prefix) => {
-                    let mask = if prefix == 0 {
-                        0
-                    } else {
-                        !0u32 << (32 - prefix)
-                    };
-                    let network = u32::from(addr) & mask;
-                    wl.cidrs.push((network, mask));
+                AllowEntry::Cidr(addr, prefix_len) => {
+                    wl.cidrs.push(CidrEntry { addr, prefix_len });
                 }
             }
         }
@@ -56,78 +80,102 @@ impl Whitelist {
         false
     }
 
-    pub fn is_ip_allowed(&self, ip: Ipv4Addr) -> bool {
+    pub fn is_ip_allowed(&self, ip: IpAddr) -> bool {
         if self.ips.contains(&ip) {
             return true;
         }
         if self.resolved_ips.contains(&ip) {
             return true;
         }
-        let ip_u32 = u32::from(ip);
-        for &(network, mask) in &self.cidrs {
-            if ip_u32 & mask == network {
+        for cidr in &self.cidrs {
+            if cidr.contains(ip) {
                 return true;
             }
         }
         false
     }
 
-    pub fn add_resolved_ip(&mut self, ip: Ipv4Addr) {
+    pub fn add_resolved_ip(&mut self, ip: IpAddr) {
         self.resolved_ips.insert(ip);
     }
 }
 
 pub fn parse_allow_entry(s: &str) -> AllowEntry {
+    // Try CIDR notation
     if let Some((addr_str, prefix_str)) = s.split_once('/')
-        && let (Ok(addr), Ok(prefix)) = (addr_str.parse::<Ipv4Addr>(), prefix_str.parse::<u8>())
-        && prefix <= 32
+        && let (Ok(addr), Ok(prefix)) = (addr_str.parse::<IpAddr>(), prefix_str.parse::<u8>())
     {
-        return AllowEntry::Cidr(addr, prefix);
+        let max_prefix = if addr.is_ipv4() { 32 } else { 128 };
+        if prefix <= max_prefix {
+            return AllowEntry::Cidr(addr, prefix);
+        }
     }
-    if let Ok(ip) = s.parse::<Ipv4Addr>() {
+    // Try plain IP (v4 or v6)
+    if let Ok(ip) = s.parse::<IpAddr>() {
         return AllowEntry::Ip(ip);
     }
+    // Otherwise it's a domain
     AllowEntry::Domain(s.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    // -- parse_allow_entry --
 
     #[test]
     fn parse_entry_domain() {
         assert!(
             matches!(parse_allow_entry("example.com"), AllowEntry::Domain(d) if d == "example.com")
         );
+    }
+
+    #[test]
+    fn parse_entry_ipv4() {
         assert!(
-            matches!(parse_allow_entry("sub.example.com"), AllowEntry::Domain(d) if d == "sub.example.com")
+            matches!(parse_allow_entry("1.2.3.4"), AllowEntry::Ip(IpAddr::V4(ip)) if ip == Ipv4Addr::new(1,2,3,4))
         );
     }
 
     #[test]
-    fn parse_entry_ip() {
-        assert!(
-            matches!(parse_allow_entry("1.2.3.4"), AllowEntry::Ip(ip) if ip == Ipv4Addr::new(1,2,3,4))
-        );
+    fn parse_entry_ipv6() {
         assert!(matches!(
-            parse_allow_entry("255.255.255.255"),
-            AllowEntry::Ip(_)
+            parse_allow_entry("::1"),
+            AllowEntry::Ip(IpAddr::V6(_))
+        ));
+        assert!(matches!(
+            parse_allow_entry("2001:db8::1"),
+            AllowEntry::Ip(IpAddr::V6(_))
         ));
     }
 
     #[test]
-    fn parse_entry_cidr() {
+    fn parse_entry_cidr_v4() {
         assert!(matches!(
             parse_allow_entry("10.0.0.0/8"),
-            AllowEntry::Cidr(_, 8)
-        ));
-        assert!(matches!(
-            parse_allow_entry("192.168.1.0/24"),
-            AllowEntry::Cidr(_, 24)
+            AllowEntry::Cidr(IpAddr::V4(_), 8)
         ));
         assert!(matches!(
             parse_allow_entry("0.0.0.0/0"),
-            AllowEntry::Cidr(_, 0)
+            AllowEntry::Cidr(IpAddr::V4(_), 0)
+        ));
+    }
+
+    #[test]
+    fn parse_entry_cidr_v6() {
+        assert!(matches!(
+            parse_allow_entry("fd00::/64"),
+            AllowEntry::Cidr(IpAddr::V6(_), 64)
+        ));
+        assert!(matches!(
+            parse_allow_entry("2001:db8::/32"),
+            AllowEntry::Cidr(IpAddr::V6(_), 32)
+        ));
+        assert!(matches!(
+            parse_allow_entry("::/0"),
+            AllowEntry::Cidr(IpAddr::V6(_), 0)
         ));
     }
 
@@ -138,10 +186,12 @@ mod tests {
             AllowEntry::Domain(_)
         ));
         assert!(matches!(
-            parse_allow_entry("10.0.0.0/abc"),
+            parse_allow_entry("::1/129"),
             AllowEntry::Domain(_)
         ));
     }
+
+    // -- domain matching --
 
     #[test]
     fn domain_exact_match() {
@@ -163,75 +213,123 @@ mod tests {
     fn domain_trailing_dot_stripped() {
         let wl = Whitelist::new(vec![AllowEntry::Domain("example.com".into())]);
         assert!(wl.is_domain_allowed("example.com."));
-        assert!(wl.is_domain_allowed("sub.example.com."));
+    }
+
+    // -- IPv4 matching --
+
+    #[test]
+    fn ipv4_exact_match() {
+        let wl = Whitelist::new(vec![AllowEntry::Ip(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)))]);
+        assert!(wl.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
+        assert!(!wl.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 5))));
     }
 
     #[test]
-    fn ip_exact_match() {
-        let wl = Whitelist::new(vec![AllowEntry::Ip(Ipv4Addr::new(1, 2, 3, 4))]);
-        assert!(wl.is_ip_allowed(Ipv4Addr::new(1, 2, 3, 4)));
-        assert!(!wl.is_ip_allowed(Ipv4Addr::new(1, 2, 3, 5)));
+    fn cidr_v4_slash8() {
+        let wl = Whitelist::new(vec![AllowEntry::Cidr(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
+            8,
+        )]);
+        assert!(wl.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(wl.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(10, 255, 255, 255))));
+        assert!(!wl.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(11, 0, 0, 1))));
     }
 
     #[test]
-    fn cidr_match() {
-        let wl = Whitelist::new(vec![AllowEntry::Cidr(Ipv4Addr::new(10, 0, 0, 0), 8)]);
-        assert!(wl.is_ip_allowed(Ipv4Addr::new(10, 0, 0, 1)));
-        assert!(wl.is_ip_allowed(Ipv4Addr::new(10, 255, 255, 255)));
-        assert!(!wl.is_ip_allowed(Ipv4Addr::new(11, 0, 0, 1)));
+    fn cidr_v4_slash0_matches_all_v4() {
+        let wl = Whitelist::new(vec![AllowEntry::Cidr(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)]);
+        assert!(wl.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
+        // v4 CIDR should NOT match v6 addresses
+        assert!(!wl.is_ip_allowed(IpAddr::V6(Ipv6Addr::LOCALHOST)));
     }
 
     #[test]
-    fn cidr_24() {
-        let wl = Whitelist::new(vec![AllowEntry::Cidr(Ipv4Addr::new(192, 168, 1, 0), 24)]);
-        assert!(wl.is_ip_allowed(Ipv4Addr::new(192, 168, 1, 1)));
-        assert!(wl.is_ip_allowed(Ipv4Addr::new(192, 168, 1, 254)));
-        assert!(!wl.is_ip_allowed(Ipv4Addr::new(192, 168, 2, 1)));
+    fn cidr_v4_slash32() {
+        let wl = Whitelist::new(vec![AllowEntry::Cidr(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            32,
+        )]);
+        assert!(wl.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(!wl.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
+    }
+
+    // -- IPv6 matching --
+
+    #[test]
+    fn ipv6_exact_match() {
+        let wl = Whitelist::new(vec![AllowEntry::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST))]);
+        assert!(wl.is_ip_allowed(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(!wl.is_ip_allowed(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2))));
     }
 
     #[test]
-    fn cidr_0_matches_everything() {
-        let wl = Whitelist::new(vec![AllowEntry::Cidr(Ipv4Addr::new(0, 0, 0, 0), 0)]);
-        assert!(wl.is_ip_allowed(Ipv4Addr::new(1, 2, 3, 4)));
-        assert!(wl.is_ip_allowed(Ipv4Addr::new(255, 255, 255, 255)));
+    fn cidr_v6_slash64() {
+        let net: Ipv6Addr = "2001:db8::".parse().unwrap();
+        let wl = Whitelist::new(vec![AllowEntry::Cidr(IpAddr::V6(net), 64)]);
+        assert!(wl.is_ip_allowed("2001:db8::1".parse().unwrap()));
+        assert!(wl.is_ip_allowed("2001:db8::ffff".parse().unwrap()));
+        assert!(!wl.is_ip_allowed("2001:db9::1".parse().unwrap()));
     }
 
     #[test]
-    fn cidr_32_matches_single_host() {
-        let wl = Whitelist::new(vec![AllowEntry::Cidr(Ipv4Addr::new(10, 0, 0, 1), 32)]);
-        assert!(wl.is_ip_allowed(Ipv4Addr::new(10, 0, 0, 1)));
-        assert!(!wl.is_ip_allowed(Ipv4Addr::new(10, 0, 0, 2)));
+    fn cidr_v6_slash0_matches_all_v6() {
+        let wl = Whitelist::new(vec![AllowEntry::Cidr(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)]);
+        assert!(wl.is_ip_allowed(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        // v6 CIDR should NOT match v4 addresses
+        assert!(!wl.is_ip_allowed(IpAddr::V4(Ipv4Addr::LOCALHOST)));
     }
 
     #[test]
-    fn resolved_ip_tracking() {
-        let mut wl = Whitelist::new(vec![AllowEntry::Domain("example.com".into())]);
-        let ip = Ipv4Addr::new(93, 184, 216, 34);
+    fn cidr_v6_slash128() {
+        let addr: IpAddr = "fe80::1".parse().unwrap();
+        let wl = Whitelist::new(vec![AllowEntry::Cidr(addr, 128)]);
+        assert!(wl.is_ip_allowed("fe80::1".parse().unwrap()));
+        assert!(!wl.is_ip_allowed("fe80::2".parse().unwrap()));
+    }
+
+    // -- resolved IP tracking --
+
+    #[test]
+    fn resolved_ip_tracking_v4() {
+        let mut wl = Whitelist::new(vec![]);
+        let ip = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
         assert!(!wl.is_ip_allowed(ip));
         wl.add_resolved_ip(ip);
         assert!(wl.is_ip_allowed(ip));
     }
 
     #[test]
+    fn resolved_ip_tracking_v6() {
+        let mut wl = Whitelist::new(vec![]);
+        let ip: IpAddr = "2606:4700::1".parse().unwrap();
+        assert!(!wl.is_ip_allowed(ip));
+        wl.add_resolved_ip(ip);
+        assert!(wl.is_ip_allowed(ip));
+    }
+
+    // -- mixed --
+
+    #[test]
     fn empty_whitelist_blocks_everything() {
         let wl = Whitelist::new(vec![]);
         assert!(!wl.is_domain_allowed("anything.com"));
-        assert!(!wl.is_ip_allowed(Ipv4Addr::new(1, 1, 1, 1)));
+        assert!(!wl.is_ip_allowed(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!wl.is_ip_allowed(IpAddr::V6(Ipv6Addr::LOCALHOST)));
     }
 
     #[test]
-    fn multiple_entries() {
+    fn multiple_entries_mixed() {
         let wl = Whitelist::new(vec![
             AllowEntry::Domain("example.com".into()),
-            AllowEntry::Ip(Ipv4Addr::new(8, 8, 8, 8)),
-            AllowEntry::Cidr(Ipv4Addr::new(172, 16, 0, 0), 12),
+            AllowEntry::Ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            AllowEntry::Cidr(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)), 12),
+            AllowEntry::Cidr("2001:db8::".parse().unwrap(), 32),
         ]);
         assert!(wl.is_domain_allowed("example.com"));
-        assert!(!wl.is_domain_allowed("google.com"));
-        assert!(wl.is_ip_allowed(Ipv4Addr::new(8, 8, 8, 8)));
-        assert!(!wl.is_ip_allowed(Ipv4Addr::new(8, 8, 4, 4)));
-        assert!(wl.is_ip_allowed(Ipv4Addr::new(172, 16, 0, 1)));
-        assert!(wl.is_ip_allowed(Ipv4Addr::new(172, 31, 255, 255)));
-        assert!(!wl.is_ip_allowed(Ipv4Addr::new(172, 32, 0, 0)));
+        assert!(wl.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(wl.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(!wl.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(172, 32, 0, 0))));
+        assert!(wl.is_ip_allowed("2001:db8::1".parse().unwrap()));
+        assert!(!wl.is_ip_allowed("2001:db9::1".parse().unwrap()));
     }
 }

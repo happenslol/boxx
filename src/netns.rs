@@ -21,6 +21,7 @@ const RTA_GATEWAY: u16 = 5;
 const RTA_OIF: u16 = 4;
 
 const AF_INET: u8 = 2;
+const AF_INET6: u8 = 10;
 const RT_SCOPE_UNIVERSE: u8 = 0;
 const RT_TABLE_MAIN: u8 = 254;
 const RTPROT_BOOT: u8 = 3;
@@ -197,14 +198,22 @@ fn configure_network() -> Result<(), String> {
     // Bring up lo
     set_link_up(nl_fd, lo_idx)?;
 
-    // Assign IP to tap0: 10.0.2.15/24
-    add_address(nl_fd, tap_idx, [10, 0, 2, 15], 24)?;
+    // Assign IPv4 address to tap0: 10.0.2.15/24
+    add_address(nl_fd, tap_idx, AF_INET, &[10, 0, 2, 15], 24)?;
+
+    // Assign IPv6 address to tap0: fd00::15/64
+    let v6_addr: [u8; 16] = [0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x15];
+    add_address(nl_fd, tap_idx, AF_INET6, &v6_addr, 64)?;
 
     // Bring up tap0
     set_link_up(nl_fd, tap_idx)?;
 
-    // Add default route via 10.0.2.2
-    add_default_route(nl_fd, [10, 0, 2, 2], tap_idx)?;
+    // Add IPv4 default route via 10.0.2.2
+    add_default_route(nl_fd, AF_INET, &[10, 0, 2, 2], tap_idx)?;
+
+    // Add IPv6 default route via fd00::2
+    let v6_gw: [u8; 16] = [0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02];
+    add_default_route(nl_fd, AF_INET6, &v6_gw, tap_idx)?;
 
     unsafe { libc::close(nl_fd) };
     Ok(())
@@ -305,16 +314,20 @@ fn set_link_up(nl_fd: RawFd, ifindex: i32) -> Result<(), String> {
     netlink_send_and_ack(nl_fd, bytes)
 }
 
-fn add_address(nl_fd: RawFd, ifindex: i32, addr: [u8; 4], prefix_len: u8) -> Result<(), String> {
-    // Build the netlink message manually with NLA attributes
-    let mut buf = [0u8; 128];
+fn add_address(
+    nl_fd: RawFd,
+    ifindex: i32,
+    family: u8,
+    addr: &[u8],
+    prefix_len: u8,
+) -> Result<(), String> {
+    let mut buf = [0u8; 256];
     let mut pos = 0;
 
-    // nlmsghdr (16 bytes)
-    // ifaddrmsg (8 bytes)
-    // NLA: IFA_LOCAL (8 bytes: 4 header + 4 data)
-    // NLA: IFA_ADDRESS (8 bytes)
-    let total_len: u32 = 16 + 8 + 8 + 8;
+    // NLA size: 4 header + addr len, padded to 4 bytes
+    let nla_len = (4 + addr.len()) as u16;
+    let nla_padded = ((nla_len as usize) + 3) & !3;
+    let total_len: u32 = (16 + 8 + nla_padded * 2) as u32;
 
     // nlmsghdr
     buf[pos..pos + 4].copy_from_slice(&total_len.to_ne_bytes());
@@ -324,13 +337,13 @@ fn add_address(nl_fd: RawFd, ifindex: i32, addr: [u8; 4], prefix_len: u8) -> Res
     buf[pos..pos + 2]
         .copy_from_slice(&(NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL).to_ne_bytes());
     pos += 2;
-    buf[pos..pos + 4].copy_from_slice(&2u32.to_ne_bytes()); // seq
+    buf[pos..pos + 4].copy_from_slice(&2u32.to_ne_bytes());
     pos += 4;
-    buf[pos..pos + 4].copy_from_slice(&0u32.to_ne_bytes()); // pid
+    buf[pos..pos + 4].copy_from_slice(&0u32.to_ne_bytes());
     pos += 4;
 
     // ifaddrmsg
-    buf[pos] = AF_INET;
+    buf[pos] = family;
     pos += 1;
     buf[pos] = prefix_len;
     pos += 1;
@@ -342,29 +355,31 @@ fn add_address(nl_fd: RawFd, ifindex: i32, addr: [u8; 4], prefix_len: u8) -> Res
     pos += 4;
 
     // NLA: IFA_LOCAL
-    buf[pos..pos + 2].copy_from_slice(&8u16.to_ne_bytes()); // nla_len
+    buf[pos..pos + 2].copy_from_slice(&nla_len.to_ne_bytes());
     pos += 2;
     buf[pos..pos + 2].copy_from_slice(&IFA_LOCAL.to_ne_bytes());
     pos += 2;
-    buf[pos..pos + 4].copy_from_slice(&addr);
-    pos += 4;
+    buf[pos..pos + addr.len()].copy_from_slice(addr);
+    pos += nla_padded - 4;
 
     // NLA: IFA_ADDRESS
-    buf[pos..pos + 2].copy_from_slice(&8u16.to_ne_bytes());
+    buf[pos..pos + 2].copy_from_slice(&nla_len.to_ne_bytes());
     pos += 2;
     buf[pos..pos + 2].copy_from_slice(&IFA_ADDRESS.to_ne_bytes());
     pos += 2;
-    buf[pos..pos + 4].copy_from_slice(&addr);
+    buf[pos..pos + addr.len()].copy_from_slice(addr);
 
     netlink_send_and_ack(nl_fd, &buf[..total_len as usize])
 }
 
-fn add_default_route(nl_fd: RawFd, gateway: [u8; 4], oif: i32) -> Result<(), String> {
-    let mut buf = [0u8; 128];
+fn add_default_route(nl_fd: RawFd, family: u8, gateway: &[u8], oif: i32) -> Result<(), String> {
+    let mut buf = [0u8; 256];
     let mut pos = 0;
 
-    // nlmsghdr (16) + rtmsg (12) + NLA RTA_GATEWAY (8) + NLA RTA_OIF (8)
-    let total_len: u32 = 16 + 12 + 8 + 8;
+    let gw_nla_len = (4 + gateway.len()) as u16;
+    let gw_nla_padded = ((gw_nla_len as usize) + 3) & !3;
+    let oif_nla_len: usize = 8; // 4 header + 4 data
+    let total_len: u32 = (16 + 12 + gw_nla_padded + oif_nla_len) as u32;
 
     // nlmsghdr
     buf[pos..pos + 4].copy_from_slice(&total_len.to_ne_bytes());
@@ -374,13 +389,13 @@ fn add_default_route(nl_fd: RawFd, gateway: [u8; 4], oif: i32) -> Result<(), Str
     buf[pos..pos + 2]
         .copy_from_slice(&(NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL).to_ne_bytes());
     pos += 2;
-    buf[pos..pos + 4].copy_from_slice(&3u32.to_ne_bytes()); // seq
+    buf[pos..pos + 4].copy_from_slice(&3u32.to_ne_bytes());
     pos += 4;
-    buf[pos..pos + 4].copy_from_slice(&0u32.to_ne_bytes()); // pid
+    buf[pos..pos + 4].copy_from_slice(&0u32.to_ne_bytes());
     pos += 4;
 
     // rtmsg
-    buf[pos] = AF_INET; // rtm_family
+    buf[pos] = family;
     pos += 1;
     buf[pos] = 0; // rtm_dst_len (0 = default route)
     pos += 1;
@@ -400,12 +415,12 @@ fn add_default_route(nl_fd: RawFd, gateway: [u8; 4], oif: i32) -> Result<(), Str
     pos += 4;
 
     // NLA: RTA_GATEWAY
-    buf[pos..pos + 2].copy_from_slice(&8u16.to_ne_bytes());
+    buf[pos..pos + 2].copy_from_slice(&gw_nla_len.to_ne_bytes());
     pos += 2;
     buf[pos..pos + 2].copy_from_slice(&RTA_GATEWAY.to_ne_bytes());
     pos += 2;
-    buf[pos..pos + 4].copy_from_slice(&gateway);
-    pos += 4;
+    buf[pos..pos + gateway.len()].copy_from_slice(gateway);
+    pos += gw_nla_padded - 4;
 
     // NLA: RTA_OIF
     buf[pos..pos + 2].copy_from_slice(&8u16.to_ne_bytes());

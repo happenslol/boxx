@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Extract the queried domain name from a DNS query packet.
 pub fn parse_query_domain(data: &[u8]) -> Option<String> {
@@ -53,8 +53,8 @@ pub fn build_nxdomain_response(query: &[u8]) -> Option<Vec<u8>> {
     Some(response)
 }
 
-/// Extract A record IPs from a DNS response.
-pub fn extract_a_records(data: &[u8]) -> Vec<Ipv4Addr> {
+/// Extract A and AAAA record IPs from a DNS response.
+pub fn extract_ip_records(data: &[u8]) -> Vec<IpAddr> {
     let mut ips = Vec::new();
     if data.len() < 12 {
         return ips;
@@ -64,43 +64,47 @@ pub fn extract_a_records(data: &[u8]) -> Vec<Ipv4Addr> {
         return ips;
     }
 
-    // Skip the header (12 bytes) and questions section
     let qdcount = u16::from_be_bytes([data[4], data[5]]);
     let mut pos = 12;
     for _ in 0..qdcount {
-        // Skip QNAME
         pos = skip_name(data, pos);
-        // Skip QTYPE (2) + QCLASS (2)
-        pos += 4;
+        pos += 4; // QTYPE + QCLASS
         if pos > data.len() {
             return ips;
         }
     }
 
-    // Parse answer records
     for _ in 0..ancount {
         if pos >= data.len() {
             break;
         }
-        // Skip NAME
         pos = skip_name(data, pos);
         if pos + 10 > data.len() {
             break;
         }
         let rtype = u16::from_be_bytes([data[pos], data[pos + 1]]);
         let rdlength = u16::from_be_bytes([data[pos + 8], data[pos + 9]]) as usize;
-        pos += 10; // TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2)
+        pos += 10;
         if pos + rdlength > data.len() {
             break;
         }
-        // A record: type 1, rdlength 4
-        if rtype == 1 && rdlength == 4 {
-            ips.push(Ipv4Addr::new(
-                data[pos],
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-            ));
+        match (rtype, rdlength) {
+            (1, 4) => {
+                // A record
+                ips.push(IpAddr::V4(Ipv4Addr::new(
+                    data[pos],
+                    data[pos + 1],
+                    data[pos + 2],
+                    data[pos + 3],
+                )));
+            }
+            (28, 16) => {
+                // AAAA record
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&data[pos..pos + 16]);
+                ips.push(IpAddr::V6(Ipv6Addr::from(octets)));
+            }
+            _ => {}
         }
         pos += rdlength;
     }
@@ -159,27 +163,29 @@ mod tests {
         buf
     }
 
-    /// Build a DNS response with A records for a given query.
-    fn make_response(query: &[u8], ips: &[Ipv4Addr]) -> Vec<u8> {
+    fn make_a_response(query: &[u8], ips: &[Ipv4Addr]) -> Vec<u8> {
         let mut buf = query.to_vec();
-        // Set QR=1
         buf[2] |= 0x80;
-        // ANCOUNT
-        let ancount = ips.len() as u16;
-        buf[6..8].copy_from_slice(&ancount.to_be_bytes());
-
+        buf[6..8].copy_from_slice(&(ips.len() as u16).to_be_bytes());
         for ip in ips {
-            // NAME: pointer to offset 12 (the QNAME in the query)
             buf.extend_from_slice(&[0xC0, 0x0C]);
-            // TYPE=A (1)
-            buf.extend_from_slice(&[0x00, 0x01]);
-            // CLASS=IN (1)
-            buf.extend_from_slice(&[0x00, 0x01]);
-            // TTL=300
-            buf.extend_from_slice(&[0x00, 0x00, 0x01, 0x2c]);
-            // RDLENGTH=4
-            buf.extend_from_slice(&[0x00, 0x04]);
-            // RDATA
+            buf.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // TYPE=A, CLASS=IN
+            buf.extend_from_slice(&[0x00, 0x00, 0x01, 0x2c]); // TTL=300
+            buf.extend_from_slice(&[0x00, 0x04]); // RDLENGTH=4
+            buf.extend_from_slice(&ip.octets());
+        }
+        buf
+    }
+
+    fn make_aaaa_response(query: &[u8], ips: &[Ipv6Addr]) -> Vec<u8> {
+        let mut buf = query.to_vec();
+        buf[2] |= 0x80;
+        buf[6..8].copy_from_slice(&(ips.len() as u16).to_be_bytes());
+        for ip in ips {
+            buf.extend_from_slice(&[0xC0, 0x0C]);
+            buf.extend_from_slice(&[0x00, 0x1C, 0x00, 0x01]); // TYPE=AAAA, CLASS=IN
+            buf.extend_from_slice(&[0x00, 0x00, 0x01, 0x2c]); // TTL=300
+            buf.extend_from_slice(&[0x00, 0x10]); // RDLENGTH=16
             buf.extend_from_slice(&ip.octets());
         }
         buf
@@ -252,58 +258,67 @@ mod tests {
     }
 
     #[test]
-    fn extract_a_records_single() {
+    fn extract_a_record() {
         let query = make_query("example.com");
-        let response = make_response(&query, &[Ipv4Addr::new(93, 184, 216, 34)]);
-        let ips = extract_a_records(&response);
-        assert_eq!(ips, vec![Ipv4Addr::new(93, 184, 216, 34)]);
+        let response = make_a_response(&query, &[Ipv4Addr::new(93, 184, 216, 34)]);
+        let ips = extract_ip_records(&response);
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
     }
 
     #[test]
-    fn extract_a_records_multiple() {
+    fn extract_multiple_a_records() {
         let query = make_query("example.com");
-        let addrs = vec![Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8)];
-        let response = make_response(&query, &addrs);
-        let ips = extract_a_records(&response);
-        assert_eq!(ips, addrs);
+        let response = make_a_response(
+            &query,
+            &[Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8)],
+        );
+        let ips = extract_ip_records(&response);
+        assert_eq!(
+            ips,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+                IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8))
+            ]
+        );
     }
 
     #[test]
-    fn extract_a_records_no_answers() {
+    fn extract_aaaa_record() {
         let query = make_query("example.com");
-        // Response with ANCOUNT=0
+        let v6: Ipv6Addr = "2606:4700::1".parse().unwrap();
+        let response = make_aaaa_response(&query, &[v6]);
+        let ips = extract_ip_records(&response);
+        assert_eq!(ips, vec![IpAddr::V6(v6)]);
+    }
+
+    #[test]
+    fn extract_no_answers() {
+        let query = make_query("example.com");
         let mut response = query.clone();
         response[2] |= 0x80;
-        assert!(extract_a_records(&response).is_empty());
+        assert!(extract_ip_records(&response).is_empty());
     }
 
     #[test]
-    fn extract_a_records_empty_input() {
-        assert!(extract_a_records(&[]).is_empty());
-        assert!(extract_a_records(&[0; 11]).is_empty());
+    fn extract_empty_input() {
+        assert!(extract_ip_records(&[]).is_empty());
+        assert!(extract_ip_records(&[0; 11]).is_empty());
     }
 
     #[test]
-    fn extract_a_records_skips_non_a_records() {
+    fn extract_skips_unknown_record_types() {
         let query = make_query("example.com");
         let mut response = query.clone();
         response[2] |= 0x80;
-        // ANCOUNT=1
         response[6] = 0;
-        response[7] = 1;
-        // NAME pointer
-        response.extend_from_slice(&[0xC0, 0x0C]);
-        // TYPE=AAAA (28) instead of A
-        response.extend_from_slice(&[0x00, 0x1C]);
-        // CLASS=IN
-        response.extend_from_slice(&[0x00, 0x01]);
-        // TTL
-        response.extend_from_slice(&[0x00, 0x00, 0x00, 0x3c]);
-        // RDLENGTH=16 (IPv6)
-        response.extend_from_slice(&[0x00, 0x10]);
-        // 16 bytes of IPv6 data
-        response.extend_from_slice(&[0; 16]);
+        response[7] = 1; // ANCOUNT=1
+        response.extend_from_slice(&[0xC0, 0x0C]); // name pointer
+        response.extend_from_slice(&[0x00, 0x05]); // TYPE=CNAME (5)
+        response.extend_from_slice(&[0x00, 0x01]); // CLASS=IN
+        response.extend_from_slice(&[0x00, 0x00, 0x00, 0x3c]); // TTL
+        response.extend_from_slice(&[0x00, 0x03]); // RDLENGTH=3
+        response.extend_from_slice(&[0x01, 0x78, 0x00]); // some CNAME data
 
-        assert!(extract_a_records(&response).is_empty());
+        assert!(extract_ip_records(&response).is_empty());
     }
 }
