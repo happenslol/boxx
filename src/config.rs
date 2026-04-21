@@ -1,7 +1,5 @@
 use notify::{RecursiveMode, Watcher};
 use serde::Deserialize;
-use std::collections::HashSet;
-use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -27,8 +25,8 @@ impl Config {
 }
 
 /// Candidate config paths, in the order they are merged.
-/// Earlier entries take no precedence — allowlists are additive.
-pub fn config_paths() -> Vec<PathBuf> {
+/// Allowlists are additive across files.
+fn candidate_paths() -> Vec<PathBuf> {
     let mut paths = vec![PathBuf::from(CONFIG_FILENAME)];
     if let Ok(home) = std::env::var("HOME") {
         paths.push(PathBuf::from(format!(
@@ -38,12 +36,23 @@ pub fn config_paths() -> Vec<PathBuf> {
     paths
 }
 
-/// Read and merge all existing config files. Missing files are ignored,
-/// parse errors are logged and the file is skipped.
-pub fn load_merged() -> Config {
+/// Canonicalized config paths that exist at startup. This is the
+/// authoritative set used for both sandbox masking and live-reload
+/// watching — files created after startup are intentionally ignored
+/// so the sandbox cannot materialize a config mid-run.
+pub fn existing_config_paths() -> Vec<PathBuf> {
+    candidate_paths()
+        .into_iter()
+        .filter_map(|p| std::fs::canonicalize(&p).ok())
+        .collect()
+}
+
+/// Load and merge configs from the given paths. Parse errors are
+/// logged and the file is skipped. Missing files are skipped silently.
+pub fn load(paths: &[PathBuf]) -> Config {
     let mut merged = Config::default();
-    for path in config_paths() {
-        let contents = match std::fs::read_to_string(&path) {
+    for path in paths {
+        let contents = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => continue,
         };
@@ -55,10 +64,18 @@ pub fn load_merged() -> Config {
     merged
 }
 
-/// Spawn a thread that watches config files via `notify` and sends fresh
-/// (cli + config) allow entries through `tx` whenever a file changes.
-/// The thread exits when the receiver is dropped.
-pub fn spawn_watcher(tx: mpsc::Sender<Vec<AllowEntry>>, cli_entries: Vec<AllowEntry>) {
+/// Spawn a thread that watches each given config file via `notify` and
+/// sends fresh (cli + config) allow entries through `tx` whenever a file
+/// changes. The thread exits when the receiver is dropped or on its own
+/// when no paths are given.
+pub fn spawn_watcher(
+    paths: Vec<PathBuf>,
+    tx: mpsc::Sender<Vec<AllowEntry>>,
+    cli_entries: Vec<AllowEntry>,
+) {
+    if paths.is_empty() {
+        return;
+    }
     std::thread::spawn(move || {
         let (notify_tx, notify_rx) = mpsc::channel::<notify::Result<notify::Event>>();
         let mut watcher = match notify::recommended_watcher(notify_tx) {
@@ -69,50 +86,31 @@ pub fn spawn_watcher(tx: mpsc::Sender<Vec<AllowEntry>>, cli_entries: Vec<AllowEn
             }
         };
 
-        // Watch each distinct parent directory that exists. Watching the
-        // parent (not the file) lets us catch creation of a file that did
-        // not exist at startup, and survives editor atomic-rename saves.
-        let mut watched: HashSet<PathBuf> = HashSet::new();
-        for path in config_paths() {
-            let parent = match path.parent() {
-                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-                _ => PathBuf::from("."),
-            };
-            if watched.contains(&parent) || !parent.exists() {
-                continue;
+        for path in &paths {
+            if let Err(e) = watcher.watch(path, RecursiveMode::NonRecursive) {
+                eprintln!("boxx: failed to watch {}: {}", path.display(), e);
             }
-            if let Err(e) = watcher.watch(&parent, RecursiveMode::NonRecursive) {
-                eprintln!("boxx: failed to watch {}: {}", parent.display(), e);
-                continue;
-            }
-            watched.insert(parent);
-        }
-
-        if watched.is_empty() {
-            return;
         }
 
         loop {
-            let event = match notify_rx.recv() {
-                Ok(Ok(evt)) => evt,
+            match notify_rx.recv() {
+                Ok(Ok(_)) => {}
                 Ok(Err(_)) => continue,
                 Err(_) => return,
-            };
-
-            let touches_config = event
-                .paths
-                .iter()
-                .any(|p| p.file_name() == Some(OsStr::new(CONFIG_FILENAME)));
-            if !touches_config {
-                continue;
             }
 
-            // Editors often emit several events per save (create temp,
-            // rename, chmod). Drain anything that arrives within 100ms
-            // before reloading to coalesce them.
+            // Coalesce burst events (editors emit several per save).
             while notify_rx.recv_timeout(Duration::from_millis(100)).is_ok() {}
 
-            let config = load_merged();
+            // Atomic-rename saves replace the inode; re-add each watch
+            // so we follow the new file. If a path is now gone the
+            // re-watch fails silently and we stop tracking it.
+            for path in &paths {
+                let _ = watcher.unwatch(path);
+                let _ = watcher.watch(path, RecursiveMode::NonRecursive);
+            }
+
+            let config = load(&paths);
             let mut entries = cli_entries.clone();
             entries.extend(config.to_allow_entries());
             if tx.send(entries).is_err() {

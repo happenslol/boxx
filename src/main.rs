@@ -5,6 +5,7 @@ mod proxy;
 mod whitelist;
 
 use clap::Parser;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc;
 use whitelist::{AllowEntry, Whitelist, parse_allow_entry};
@@ -31,7 +32,13 @@ fn main() {
 
     let cli_entries: Vec<AllowEntry> =
         cli.allow.iter().map(|s| parse_allow_entry(s)).collect();
-    let config_entries = config::load_merged().to_allow_entries();
+
+    // Snapshot which config files exist at startup. This set is the
+    // only source the watcher reads from, and the only set we overlay
+    // with /dev/null inside the sandbox — files the sandbox creates
+    // mid-run are never loaded.
+    let config_paths = config::existing_config_paths();
+    let config_entries = config::load(&config_paths).to_allow_entries();
     let all_entries: Vec<AllowEntry> = cli_entries
         .iter()
         .cloned()
@@ -43,11 +50,18 @@ fn main() {
     std::fs::create_dir_all(&tmp_dir).expect("failed to create tmp dir");
 
     let exit_code = if cli.allow_all {
-        run_passthrough(&home, &tmp_dir, &cli.command)
+        run_passthrough(&home, &tmp_dir, &cli.command, &config_paths)
     } else if all_entries.is_empty() {
-        run_isolated(&home, &tmp_dir, &cli.command)
+        run_isolated(&home, &tmp_dir, &cli.command, &config_paths)
     } else {
-        run_filtered(&home, &tmp_dir, &cli.command, all_entries, cli_entries)
+        run_filtered(
+            &home,
+            &tmp_dir,
+            &cli.command,
+            all_entries,
+            cli_entries,
+            config_paths,
+        )
     };
 
     std::fs::remove_dir_all(&tmp_dir).ok();
@@ -55,15 +69,15 @@ fn main() {
 }
 
 /// Run with full network access (current behavior).
-fn run_passthrough(home: &str, tmp_dir: &str, args: &[String]) -> i32 {
-    let mut cmd = build_bwrap_cmd(home, tmp_dir, BwrapNetMode::Passthrough);
+fn run_passthrough(home: &str, tmp_dir: &str, args: &[String], masked: &[PathBuf]) -> i32 {
+    let mut cmd = build_bwrap_cmd(home, tmp_dir, BwrapNetMode::Passthrough, masked);
     cmd.args(args);
     exec_bwrap(cmd)
 }
 
 /// Run with no network access at all.
-fn run_isolated(home: &str, tmp_dir: &str, args: &[String]) -> i32 {
-    let mut cmd = build_bwrap_cmd(home, tmp_dir, BwrapNetMode::Isolated);
+fn run_isolated(home: &str, tmp_dir: &str, args: &[String], masked: &[PathBuf]) -> i32 {
+    let mut cmd = build_bwrap_cmd(home, tmp_dir, BwrapNetMode::Isolated, masked);
     cmd.args(args);
     exec_bwrap(cmd)
 }
@@ -75,6 +89,7 @@ fn run_filtered(
     args: &[String],
     entries: Vec<AllowEntry>,
     cli_entries: Vec<AllowEntry>,
+    masked: Vec<PathBuf>,
 ) -> i32 {
     let mut whitelist = Whitelist::new(entries);
 
@@ -96,11 +111,17 @@ fn run_filtered(
     let tmp_dir_clone = tmp_dir.to_string();
     let resolv_clone = resolv_path.clone();
     let args_clone = args.to_vec();
+    let masked_clone = masked.clone();
 
     let sandbox = netns::setup_sandbox_netns_with_child(move || {
         // This runs in the child process, inside the new user+net namespace.
         // Use Filtered mode: skip user/net unshare since we already did that.
-        let mut cmd = build_bwrap_cmd(&home_clone, &tmp_dir_clone, BwrapNetMode::Filtered);
+        let mut cmd = build_bwrap_cmd(
+            &home_clone,
+            &tmp_dir_clone,
+            BwrapNetMode::Filtered,
+            &masked_clone,
+        );
 
         // Override the real resolv.conf file (following symlinks)
         cmd.args(["--ro-bind", &resolv_clone, &resolv_target_str]);
@@ -124,7 +145,7 @@ fn run_filtered(
     // Spawn config watcher (parent only — after fork). It pushes
     // fresh (cli + config) allow entries through the channel on change.
     let (reload_tx, reload_rx) = mpsc::channel();
-    config::spawn_watcher(reload_tx, cli_entries);
+    config::spawn_watcher(masked, reload_tx, cli_entries);
 
     // Run the proxy loop (blocks until child exits)
     proxy::run_proxy(sandbox.tap_fd, &mut whitelist, sandbox.child_pid, reload_rx);
@@ -148,7 +169,12 @@ enum BwrapNetMode {
     Filtered,
 }
 
-fn build_bwrap_cmd(home: &str, tmp_dir: &str, net_mode: BwrapNetMode) -> Command {
+fn build_bwrap_cmd(
+    home: &str,
+    tmp_dir: &str,
+    net_mode: BwrapNetMode,
+    masked: &[PathBuf],
+) -> Command {
     let mut cmd = Command::new("bwrap");
 
     match net_mode {
@@ -213,6 +239,15 @@ fn build_bwrap_cmd(home: &str, tmp_dir: &str, net_mode: BwrapNetMode) -> Command
         let cwd = cwd.to_str().expect("cwd is not valid utf-8");
         cmd.args(["--bind", cwd, cwd]);
         cmd.args(["--chdir", cwd]);
+    }
+
+    // Mask config files — sandbox sees an empty read-only file at each
+    // path, regardless of the real contents on the host. Must come after
+    // the parent directory binds above so the overlay sits on top.
+    for path in masked {
+        if let Some(p) = path.to_str() {
+            cmd.args(["--ro-bind", "/dev/null", p]);
+        }
     }
 
     cmd
