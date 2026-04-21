@@ -1,7 +1,42 @@
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn boxx_bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_boxx"))
+}
+
+/// Self-cleaning temp directory. Gives each test a fresh, isolated
+/// cwd so config-file tests don't collide.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(name: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("boxx-test-{name}-{pid}-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+/// boxx rooted in `dir` as both cwd and HOME, so the test can't see
+/// the developer's real `~/.config/boxx/boxx.toml`.
+fn boxx_in(dir: &Path) -> Command {
+    let mut cmd = boxx_bin();
+    cmd.current_dir(dir);
+    cmd.env("HOME", dir);
+    cmd
 }
 
 // -- Passthrough mode (--allow-all) --
@@ -209,6 +244,120 @@ fn only_flags_no_command_exits_with_error() {
         .output()
         .unwrap();
     assert!(!out.status.success());
+}
+
+// -- Config file --
+
+#[test]
+fn config_file_masked_inside_sandbox() {
+    let dir = TempDir::new("mask");
+    let config_path = dir.path().join("boxx.toml");
+    let original = "allow = [\"secret.example\"]\n";
+    std::fs::write(&config_path, original).unwrap();
+
+    // Read attempt: sandbox sees /dev/null-bound file, open fails.
+    let out = boxx_in(dir.path())
+        .args(["--allow-all", "--", "cat", "boxx.toml"])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "reading masked config should fail, stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    // Write attempt: ro-bind blocks writes.
+    let out = boxx_in(dir.path())
+        .args([
+            "--allow-all",
+            "--",
+            "sh",
+            "-c",
+            "echo pwned > boxx.toml",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "writing masked config should fail");
+
+    // Host file must be untouched.
+    let on_disk = std::fs::read_to_string(&config_path).unwrap();
+    assert_eq!(
+        on_disk, original,
+        "host config was modified despite the mask"
+    );
+}
+
+#[test]
+fn config_file_drives_allowlist() {
+    let dir = TempDir::new("load");
+    std::fs::write(
+        dir.path().join("boxx.toml"),
+        "allow = [\"example.com\"]\n",
+    )
+    .unwrap();
+
+    // No --allow on the CLI — filtered mode is reached purely via the
+    // config file's allowlist.
+    let out = boxx_in(dir.path())
+        .args([
+            "--",
+            "curl",
+            "-s",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "15",
+            "https://example.com",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Example Domain"),
+        "config-driven allowlist should permit example.com, got: {stdout}"
+    );
+}
+
+#[test]
+fn config_live_reload_applies() {
+    let dir = TempDir::new("reload");
+    let config_path = dir.path().join("boxx.toml");
+
+    // Start with an entry that forces filtered mode but does not permit
+    // example.com. The sandbox's first DNS query therefore returns
+    // NXDOMAIN from our proxy.
+    std::fs::write(&config_path, "allow = [\"placeholder.invalid\"]\n").unwrap();
+
+    let child = boxx_in(dir.path())
+        .args([
+            "--",
+            "sh",
+            "-c",
+            "getent hosts example.com >/dev/null 2>&1 && echo pre_ok || echo pre_fail; \
+             sleep 3; \
+             getent hosts example.com >/dev/null 2>&1 && echo post_ok || echo post_fail",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Wait long enough for the first getent to run, then rewrite the
+    // config. The watcher should pick this up, reload the proxy's
+    // whitelist, and the second getent (after the 3s sleep) should win.
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    std::fs::write(&config_path, "allow = [\"example.com\"]\n").unwrap();
+
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("pre_fail"),
+        "expected pre_fail before reload, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("post_ok"),
+        "expected post_ok after live reload, got: {stdout}"
+    );
 }
 
 #[test]
