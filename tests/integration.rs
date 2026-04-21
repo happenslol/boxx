@@ -360,6 +360,64 @@ fn config_live_reload_applies() {
     );
 }
 
+// -- Home files --
+
+#[test]
+fn gitconfig_is_mounted_readonly() {
+    let dir = TempDir::new("git");
+    let gitconfig = dir.path().join(".gitconfig");
+    let original = "[user]\n\tname = Test User\n\temail = test@example.com\n";
+    std::fs::write(&gitconfig, original).unwrap();
+
+    // Sandbox sees the host's .gitconfig contents at $HOME/.gitconfig.
+    let out = boxx_in(dir.path())
+        .args([
+            "--allow-all",
+            "--",
+            "sh",
+            "-c",
+            "cat \"$HOME/.gitconfig\"",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "reading .gitconfig failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), original);
+
+    // ro-bind means writes must fail.
+    let out = boxx_in(dir.path())
+        .args([
+            "--allow-all",
+            "--",
+            "sh",
+            "-c",
+            "echo hacked > \"$HOME/.gitconfig\"",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "write to .gitconfig should fail");
+
+    // And the host file is untouched.
+    let on_disk = std::fs::read_to_string(&gitconfig).unwrap();
+    assert_eq!(on_disk, original);
+}
+
+#[test]
+fn missing_gitconfig_is_skipped() {
+    // No .gitconfig in the test HOME — boxx should launch cleanly anyway.
+    let dir = TempDir::new("nogit");
+    let out = boxx_in(dir.path())
+        .args(["--allow-all", "--", "echo", "ok"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+}
+
 #[test]
 fn command_without_separator() {
     // Command without -- should still work (first non-flag arg starts command)

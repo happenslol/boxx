@@ -241,6 +241,13 @@ fn build_bwrap_cmd(
         cmd.args(["--chdir", cwd]);
     }
 
+    // Home files (read-only). Must come after the cwd bind above so that
+    // when cwd == home the file ro-bind still overlays the rw bind.
+    let gitconfig = format!("{home}/.gitconfig");
+    if std::fs::metadata(&gitconfig).is_ok() {
+        cmd.args(["--ro-bind", &gitconfig, &gitconfig]);
+    }
+
     // Mask config files — sandbox sees an empty read-only file at each
     // path, regardless of the real contents on the host. Must come after
     // the parent directory binds above so the overlay sits on top.
