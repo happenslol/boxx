@@ -1,0 +1,8 @@
+allow = [
+    "openrouter.ai",
+    "anthropic.com",
+    "github.com",
+    "githubusercontent.com",
+    "docs.rs",
+    "crates.io",
+]

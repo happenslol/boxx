@@ -206,6 +206,33 @@ fn extract_tcp_syn(frame: &[u8]) -> Option<(IpAddr, u16)> {
     }
 }
 
+/// Returns true if the host kernel has a non-reject default IPv6 route.
+/// Parses `/proc/net/ipv6_route`: we look for a row with destination
+/// `::/0` whose flags do NOT include RTF_REJECT (0x0200). Purely local
+/// entries (dst=0/0 but flagged REJECT, e.g. on hosts with no upstream
+/// IPv6) correctly return false.
+fn host_has_ipv6_route() -> bool {
+    let contents = match std::fs::read_to_string("/proc/net/ipv6_route") {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    for line in contents.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 10 {
+            continue;
+        }
+        if parts[0] != "00000000000000000000000000000000" || parts[1] != "00" {
+            continue;
+        }
+        let flags = u32::from_str_radix(parts[8], 16).unwrap_or(0);
+        if flags & 0x0200 != 0 {
+            continue; // RTF_REJECT — route exists but drops everything
+        }
+        return true;
+    }
+    false
+}
+
 fn now() -> Instant {
     let d = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -213,14 +240,15 @@ fn now() -> Instant {
     Instant::from_millis(d.as_millis() as i64)
 }
 
-/// Run the proxy loop. Blocks until the child process exits.
-/// `reload_rx` delivers fresh allow entries from the config watcher.
+/// Run the proxy loop. Blocks until the child process exits and returns
+/// its exit status. `reload_rx` delivers fresh allow entries from the
+/// config watcher.
 pub fn run_proxy(
     tap_fd: RawFd,
     whitelist: &mut Whitelist,
     child_pid: i32,
     reload_rx: mpsc::Receiver<Vec<AllowEntry>>,
-) {
+) -> i32 {
     let mut device = TapDevice::new(tap_fd);
 
     let config = Config::new(HardwareAddress::Ethernet(GATEWAY_MAC));
@@ -256,40 +284,58 @@ pub fn run_proxy(
     // Track which ports we already have smoltcp sockets listening on
     let mut listening_ports: HashMap<u16, SocketHandle> = HashMap::new();
 
+    // Probe IPv6 reachability once. If the host has no non-reject default
+    // IPv6 route, we synthesize empty AAAA answers so the sandbox never
+    // tries IPv6 and then fails halfway through TLS when we have to RST.
+    let ipv6_reachable = host_has_ipv6_route();
+
     loop {
         // Apply any pending config reloads
         while let Ok(entries) = reload_rx.try_recv() {
             whitelist.reload(entries);
         }
 
-        // Check if child is still alive
+        // Check if child is still alive. WNOHANG reaps on exit, so we
+        // capture the status here and return it — a second waitpid would
+        // fail with ECHILD.
         let mut status = 0i32;
         let ret = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
         if ret > 0 {
-            // Child exited
-            break;
+            return if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                1
+            };
         }
 
         // Read from TAP device
         device.poll_read();
 
         // Peek at the frame before smoltcp processes it.
-        // If it's a TCP SYN to an allowed destination, pre-create a listening socket.
+        // If it's a TCP SYN to an allowed destination, pre-create a
+        // listening socket — but only if we don't already have one in
+        // LISTEN state on that port. Once a listener accepts a SYN it
+        // transitions out of LISTEN; a subsequent parallel connection
+        // on the same port needs its own fresh listener.
         if let Some(frame) = device.peek()
             && let Some((dst_ip, dst_port)) = extract_tcp_syn(frame)
             && whitelist.is_ip_allowed(dst_ip)
-            && !listening_ports.contains_key(&dst_port)
         {
-            let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65535]);
-            let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65535]);
-            let tcp_socket = tcp::Socket::new(rx_buf, tx_buf);
-            let handle = sockets.add(tcp_socket);
-            sockets
-                .get_mut::<tcp::Socket>(handle)
-                .listen(dst_port)
-                .expect("failed to listen on TCP port");
-            listening_ports.insert(dst_port, handle);
-            tcp_bridges.insert(handle, TcpBridge::new(dst_ip, dst_port));
+            let has_listener = listening_ports.get(&dst_port).is_some_and(|&h| {
+                sockets.get::<tcp::Socket>(h).state() == tcp::State::Listen
+            });
+            if !has_listener {
+                let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65535]);
+                let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65535]);
+                let tcp_socket = tcp::Socket::new(rx_buf, tx_buf);
+                let handle = sockets.add(tcp_socket);
+                sockets
+                    .get_mut::<tcp::Socket>(handle)
+                    .listen(dst_port)
+                    .expect("failed to listen on TCP port");
+                listening_ports.insert(dst_port, handle);
+                tcp_bridges.insert(handle, TcpBridge::new(dst_ip, dst_port));
+            }
         }
 
         // Let smoltcp process the frame
@@ -308,6 +354,7 @@ pub fn run_proxy(
                 &data,
                 meta,
                 whitelist,
+                ipv6_reachable,
                 sockets.get_mut::<udp::Socket>(dns_handle),
             );
         }
@@ -328,39 +375,50 @@ pub fn run_proxy(
             if let Some(ref mut stream) = bridge.host_stream {
                 let sock = sockets.get_mut::<tcp::Socket>(handle);
 
-                // Sandbox → Host
+                // Sandbox → Host. WouldBlock on the host stream means the
+                // kernel TX buffer is full; we consume 0 bytes from smoltcp
+                // and retry next iteration. Only real write errors close.
                 if sock.can_recv() {
-                    match sock.recv(|data| {
-                        let written = stream.write(data).unwrap_or(0);
-                        (written, written)
-                    }) {
-                        Ok(0) | Err(_) => {
-                            bridge.closed = true;
-                        }
-                        Ok(_) => {}
+                    let mut stream_err = false;
+                    let recv_ok = sock
+                        .recv(|data| match stream.write(data) {
+                            Ok(n) => (n, ()),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (0, ()),
+                            Err(_) => {
+                                stream_err = true;
+                                (0, ())
+                            }
+                        })
+                        .is_ok();
+                    if !recv_ok || stream_err {
+                        bridge.closed = true;
                     }
                 }
 
-                // Host → Sandbox
+                // Host → Sandbox. Critically, size the read to smoltcp's
+                // available TX space. Reading more than we can enqueue
+                // would silently drop the excess (TLS records corrupt).
                 if sock.can_send() {
-                    let mut buf = [0u8; 4096];
-                    match stream.read(&mut buf) {
-                        Ok(0) => {
-                            sock.close();
-                            bridge.closed = true;
-                        }
-                        Ok(n) => {
-                            sock.send(|send_buf| {
-                                let to_write = n.min(send_buf.len());
-                                send_buf[..to_write].copy_from_slice(&buf[..to_write]);
-                                (to_write, ())
-                            })
-                            .ok();
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(_) => {
-                            sock.close();
-                            bridge.closed = true;
+                    let send_space = sock.send_capacity().saturating_sub(sock.send_queue());
+                    if send_space > 0 {
+                        let mut buf = [0u8; 4096];
+                        let read_len = send_space.min(buf.len());
+                        match stream.read(&mut buf[..read_len]) {
+                            Ok(0) => {
+                                sock.close();
+                                bridge.closed = true;
+                            }
+                            Ok(n) => {
+                                let enqueued = sock.send_slice(&buf[..n]).unwrap_or(0);
+                                if enqueued < n {
+                                    bridge.closed = true;
+                                }
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(_) => {
+                                sock.close();
+                                bridge.closed = true;
+                            }
                         }
                     }
                 }
@@ -388,6 +446,7 @@ fn handle_dns(
     data: &[u8],
     meta: udp::UdpMetadata,
     whitelist: &mut Whitelist,
+    ipv6_reachable: bool,
     dns_socket: &mut udp::Socket,
 ) {
     let domain = match dns::parse_query_domain(data) {
@@ -402,6 +461,18 @@ fn handle_dns(
     };
 
     if whitelist.is_domain_allowed(&domain) {
+        // If the host has no IPv6, short-circuit AAAA queries with an
+        // empty NOERROR response. Forwarding upstream AAAA records would
+        // make the sandbox try IPv6 addresses we can't route, which we'd
+        // have to RST mid-handshake — clients see that as a fatal TLS
+        // reset rather than "try the next address".
+        if !ipv6_reachable && dns::parse_query_type(data) == Some(dns::QTYPE_AAAA) {
+            if let Some(response) = dns::build_empty_response(data) {
+                dns_socket.send_slice(&response, reply_meta).ok();
+            }
+            return;
+        }
+
         if let Some(response) = dns::forward_query(data) {
             for ip in dns::extract_ip_records(&response) {
                 whitelist.add_resolved_ip(ip);

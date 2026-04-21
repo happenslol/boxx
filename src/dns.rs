@@ -53,6 +53,53 @@ pub fn build_nxdomain_response(query: &[u8]) -> Option<Vec<u8>> {
     Some(response)
 }
 
+/// Build an empty NOERROR response (RCODE=0, no answers). Used to tell
+/// the sandbox "this name has no records of the requested type" without
+/// claiming the name doesn't exist — so resolvers move on to the next
+/// record type rather than giving up.
+pub fn build_empty_response(query: &[u8]) -> Option<Vec<u8>> {
+    if query.len() < 12 {
+        return None;
+    }
+    let mut response = query.to_vec();
+    response[2] = (query[2] & 0x78) | 0x80; // QR=1
+    response[3] = (query[3] & 0x70) | 0x80; // RA=1, RCODE=0
+    response[6..12].copy_from_slice(&[0, 0, 0, 0, 0, 0]);
+    Some(response)
+}
+
+pub const QTYPE_AAAA: u16 = 28;
+
+/// Extract QTYPE from a DNS query. Returns None if malformed.
+pub fn parse_query_type(data: &[u8]) -> Option<u16> {
+    if data.len() < 12 {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([data[4], data[5]]);
+    if qdcount == 0 {
+        return None;
+    }
+    let mut pos = 12;
+    loop {
+        if pos >= data.len() {
+            return None;
+        }
+        let len = data[pos] as usize;
+        if len == 0 {
+            pos += 1;
+            break;
+        }
+        if len & 0xC0 == 0xC0 {
+            return None;
+        }
+        pos += 1 + len;
+    }
+    if pos + 2 > data.len() {
+        return None;
+    }
+    Some(u16::from_be_bytes([data[pos], data[pos + 1]]))
+}
+
 /// Extract A and AAAA record IPs from a DNS response.
 pub fn extract_ip_records(data: &[u8]) -> Vec<IpAddr> {
     let mut ips = Vec::new();

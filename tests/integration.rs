@@ -71,8 +71,10 @@ fn isolated_runs_command() {
 
 #[test]
 fn isolated_blocks_network() {
-    // curl should fail because there's no network at all
-    let out = boxx_bin()
+    // Run from a clean tempdir+HOME so no boxx.toml flips us into
+    // filtered mode — we want to exercise actual isolated mode here.
+    let dir = TempDir::new("isolated");
+    let out = boxx_in(dir.path())
         .args([
             "--",
             "curl",

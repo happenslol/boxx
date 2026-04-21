@@ -147,17 +147,8 @@ fn run_filtered(
     let (reload_tx, reload_rx) = mpsc::channel();
     config::spawn_watcher(masked, reload_tx, cli_entries);
 
-    // Run the proxy loop (blocks until child exits)
-    proxy::run_proxy(sandbox.tap_fd, &mut whitelist, sandbox.child_pid, reload_rx);
-
-    // Collect child exit status
-    let mut status = 0i32;
-    unsafe { libc::waitpid(sandbox.child_pid, &mut status, 0) };
-    if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else {
-        1
-    }
+    // Run the proxy loop (blocks until child exits, returns its status)
+    proxy::run_proxy(sandbox.tap_fd, &mut whitelist, sandbox.child_pid, reload_rx)
 }
 
 enum BwrapNetMode {
