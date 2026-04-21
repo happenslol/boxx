@@ -1,3 +1,4 @@
+mod config;
 mod dns;
 mod netns;
 mod proxy;
@@ -5,6 +6,7 @@ mod whitelist;
 
 use clap::Parser;
 use std::process::Command;
+use std::sync::mpsc;
 use whitelist::{AllowEntry, Whitelist, parse_allow_entry};
 
 /// Lightweight sandbox for running commands with filesystem and network isolation.
@@ -27,7 +29,14 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    let allow_entries: Vec<AllowEntry> = cli.allow.iter().map(|s| parse_allow_entry(s)).collect();
+    let cli_entries: Vec<AllowEntry> =
+        cli.allow.iter().map(|s| parse_allow_entry(s)).collect();
+    let config_entries = config::load_merged().to_allow_entries();
+    let all_entries: Vec<AllowEntry> = cli_entries
+        .iter()
+        .cloned()
+        .chain(config_entries)
+        .collect();
 
     let home = std::env::var("HOME").expect("HOME not set");
     let tmp_dir = format!("/tmp/boxx-{:016x}", random_u64());
@@ -35,10 +44,10 @@ fn main() {
 
     let exit_code = if cli.allow_all {
         run_passthrough(&home, &tmp_dir, &cli.command)
-    } else if allow_entries.is_empty() {
+    } else if all_entries.is_empty() {
         run_isolated(&home, &tmp_dir, &cli.command)
     } else {
-        run_filtered(&home, &tmp_dir, &cli.command, allow_entries)
+        run_filtered(&home, &tmp_dir, &cli.command, all_entries, cli_entries)
     };
 
     std::fs::remove_dir_all(&tmp_dir).ok();
@@ -60,7 +69,13 @@ fn run_isolated(home: &str, tmp_dir: &str, args: &[String]) -> i32 {
 }
 
 /// Run with filtered network through the proxy.
-fn run_filtered(home: &str, tmp_dir: &str, args: &[String], entries: Vec<AllowEntry>) -> i32 {
+fn run_filtered(
+    home: &str,
+    tmp_dir: &str,
+    args: &[String],
+    entries: Vec<AllowEntry>,
+    cli_entries: Vec<AllowEntry>,
+) -> i32 {
     let mut whitelist = Whitelist::new(entries);
 
     // Write a resolv.conf that points DNS to our proxy gateway
@@ -106,8 +121,13 @@ fn run_filtered(home: &str, tmp_dir: &str, args: &[String], entries: Vec<AllowEn
         libc::close(sandbox.ready_fd);
     }
 
+    // Spawn config watcher (parent only — after fork). It pushes
+    // fresh (cli + config) allow entries through the channel on change.
+    let (reload_tx, reload_rx) = mpsc::channel();
+    config::spawn_watcher(reload_tx, cli_entries);
+
     // Run the proxy loop (blocks until child exits)
-    proxy::run_proxy(sandbox.tap_fd, &mut whitelist, sandbox.child_pid);
+    proxy::run_proxy(sandbox.tap_fd, &mut whitelist, sandbox.child_pid, reload_rx);
 
     // Collect child exit status
     let mut status = 0i32;

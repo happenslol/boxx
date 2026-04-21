@@ -67,6 +67,27 @@ impl Whitelist {
         wl
     }
 
+    /// Replace base entries (domains, ips, cidrs) with a new set.
+    /// Clears resolved_ips so IPs previously approved under removed rules
+    /// are no longer allowed until re-resolved.
+    pub fn reload(&mut self, entries: Vec<AllowEntry>) {
+        self.domains.clear();
+        self.ips.clear();
+        self.cidrs.clear();
+        self.resolved_ips.clear();
+        for entry in entries {
+            match entry {
+                AllowEntry::Domain(d) => self.domains.push(d),
+                AllowEntry::Ip(ip) => {
+                    self.ips.insert(ip);
+                }
+                AllowEntry::Cidr(addr, prefix_len) => {
+                    self.cidrs.push(CidrEntry { addr, prefix_len });
+                }
+            }
+        }
+    }
+
     pub fn is_domain_allowed(&self, domain: &str) -> bool {
         let domain = domain.trim_end_matches('.');
         for d in &self.domains {
@@ -305,6 +326,22 @@ mod tests {
         assert!(!wl.is_ip_allowed(ip));
         wl.add_resolved_ip(ip);
         assert!(wl.is_ip_allowed(ip));
+    }
+
+    // -- reload --
+
+    #[test]
+    fn reload_replaces_entries_and_clears_resolved() {
+        let mut wl = Whitelist::new(vec![AllowEntry::Domain("old.com".into())]);
+        wl.add_resolved_ip(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+        assert!(wl.is_domain_allowed("old.com"));
+        assert!(wl.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
+
+        wl.reload(vec![AllowEntry::Domain("new.com".into())]);
+
+        assert!(!wl.is_domain_allowed("old.com"));
+        assert!(wl.is_domain_allowed("new.com"));
+        assert!(!wl.is_ip_allowed(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))));
     }
 
     // -- mixed --

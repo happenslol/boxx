@@ -12,7 +12,7 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
 
 use crate::dns;
-use crate::whitelist::Whitelist;
+use crate::whitelist::{AllowEntry, Whitelist};
 
 const GATEWAY_IPV4: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
 const GATEWAY_IPV6: Ipv6Address = Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 2);
@@ -214,7 +214,13 @@ fn now() -> Instant {
 }
 
 /// Run the proxy loop. Blocks until the child process exits.
-pub fn run_proxy(tap_fd: RawFd, whitelist: &mut Whitelist, child_pid: i32) {
+/// `reload_rx` delivers fresh allow entries from the config watcher.
+pub fn run_proxy(
+    tap_fd: RawFd,
+    whitelist: &mut Whitelist,
+    child_pid: i32,
+    reload_rx: mpsc::Receiver<Vec<AllowEntry>>,
+) {
     let mut device = TapDevice::new(tap_fd);
 
     let config = Config::new(HardwareAddress::Ethernet(GATEWAY_MAC));
@@ -251,6 +257,11 @@ pub fn run_proxy(tap_fd: RawFd, whitelist: &mut Whitelist, child_pid: i32) {
     let mut listening_ports: HashMap<u16, SocketHandle> = HashMap::new();
 
     loop {
+        // Apply any pending config reloads
+        while let Ok(entries) = reload_rx.try_recv() {
+            whitelist.reload(entries);
+        }
+
         // Check if child is still alive
         let mut status = 0i32;
         let ret = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
