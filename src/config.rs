@@ -12,6 +12,11 @@ const CONFIG_FILENAME: &str = "boxx.toml";
 pub struct Config {
     #[serde(default)]
     pub allow: Vec<String>,
+    /// Path to the host's rootless docker socket. Defaults to
+    /// `$XDG_RUNTIME_DIR/docker.sock` when unset. Only consulted when
+    /// the sandbox is run with `--allow-docker`.
+    #[serde(default)]
+    pub docker_socket: Option<PathBuf>,
 }
 
 impl Config {
@@ -57,7 +62,12 @@ pub fn load(paths: &[PathBuf]) -> Config {
             Err(_) => continue,
         };
         match Config::parse(&contents) {
-            Ok(cfg) => merged.allow.extend(cfg.allow),
+            Ok(cfg) => {
+                merged.allow.extend(cfg.allow);
+                if let Some(sock) = cfg.docker_socket {
+                    merged.docker_socket = Some(sock);
+                }
+            }
             Err(e) => eprintln!("boxx: failed to parse {}: {}", path.display(), e),
         }
     }
@@ -151,6 +161,7 @@ mod tests {
     fn to_allow_entries_mixed() {
         let cfg = Config {
             allow: vec!["example.com".into(), "1.2.3.4".into(), "10.0.0.0/8".into()],
+            docker_socket: None,
         };
         let entries = cfg.to_allow_entries();
         assert_eq!(entries.len(), 3);

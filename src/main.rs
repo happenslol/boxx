@@ -1,5 +1,6 @@
 mod config;
 mod dns;
+mod docker;
 mod netns;
 mod proxy;
 mod whitelist;
@@ -22,6 +23,14 @@ struct Cli {
     #[arg(long = "allow-all")]
     allow_all: bool,
 
+    /// Expose a filtered docker socket to the sandbox. Uses the rootless
+    /// daemon at `$XDG_RUNTIME_DIR/docker.sock` (or `docker_socket` in
+    /// boxx.toml). Only safe mutations are forwarded; container mounts
+    /// are restricted to the current working directory and containers
+    /// created by the sandbox are isolated from the host's via a label.
+    #[arg(long = "allow-docker")]
+    allow_docker: bool,
+
     /// Command to run inside the sandbox.
     #[arg(required = true, trailing_var_arg = true)]
     command: Vec<String>,
@@ -37,17 +46,38 @@ fn main() {
     // with /dev/null inside the sandbox — files the sandbox creates
     // mid-run are never loaded.
     let config_paths = config::existing_config_paths();
-    let config_entries = config::load(&config_paths).to_allow_entries();
+    let config = config::load(&config_paths);
+    let config_entries = config.to_allow_entries();
     let all_entries: Vec<AllowEntry> = cli_entries.iter().cloned().chain(config_entries).collect();
 
     let home = std::env::var("HOME").expect("HOME not set");
     let tmp_dir = format!("/tmp/boxx-{:016x}", random_u64());
     std::fs::create_dir_all(&tmp_dir).expect("failed to create tmp dir");
 
+    // Start the docker proxy (if requested) before anything that forks —
+    // the socket file must exist for bwrap to bind-mount it, and the
+    // proxy threads live in the parent only.
+    let docker_sock = cli
+        .allow_docker
+        .then(|| setup_docker_proxy(&tmp_dir, config.docker_socket.clone()));
+    let docker_sock_ref = docker_sock.as_deref();
+
     let exit_code = if cli.allow_all {
-        run_passthrough(&home, &tmp_dir, &cli.command, &config_paths)
+        run_passthrough(
+            &home,
+            &tmp_dir,
+            &cli.command,
+            &config_paths,
+            docker_sock_ref,
+        )
     } else if all_entries.is_empty() {
-        run_isolated(&home, &tmp_dir, &cli.command, &config_paths)
+        run_isolated(
+            &home,
+            &tmp_dir,
+            &cli.command,
+            &config_paths,
+            docker_sock_ref,
+        )
     } else {
         run_filtered(
             &home,
@@ -56,6 +86,7 @@ fn main() {
             all_entries,
             cli_entries,
             config_paths,
+            docker_sock_ref,
         )
     };
 
@@ -63,16 +94,76 @@ fn main() {
     std::process::exit(exit_code);
 }
 
+/// Resolve the backend socket, start the proxy, return the host path of
+/// the proxy's listening socket (to be bind-mounted into the sandbox).
+fn setup_docker_proxy(tmp_dir: &str, configured_backend: Option<PathBuf>) -> PathBuf {
+    let backend = configured_backend.unwrap_or_else(|| {
+        let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| {
+            eprintln!(
+                "boxx: --allow-docker requires XDG_RUNTIME_DIR to be set, or `docker_socket` in boxx.toml"
+            );
+            std::process::exit(1);
+        });
+        PathBuf::from(runtime).join("docker.sock")
+    });
+    if !backend.exists() {
+        eprintln!(
+            "boxx: docker backend socket {} not found (is rootless dockerd running?)",
+            backend.display()
+        );
+        std::process::exit(1);
+    }
+    let cwd = std::env::current_dir()
+        .and_then(|p| p.canonicalize())
+        .unwrap_or_else(|e| {
+            eprintln!("boxx: failed to canonicalize cwd: {e}");
+            std::process::exit(1);
+        });
+    let proxy_socket = PathBuf::from(format!("{tmp_dir}/docker.sock"));
+    // Scope containers by the canonical cwd. Sandboxes that share a
+    // directory (including successive invocations) share containers;
+    // sandboxes in different directories are isolated from each other.
+    let sandbox_id = cwd.to_string_lossy().into_owned();
+    if let Err(e) = docker::spawn(docker::Options {
+        proxy_socket: proxy_socket.clone(),
+        backend_socket: backend,
+        sandbox_id,
+        cwd,
+    }) {
+        eprintln!("boxx: failed to start docker proxy: {e}");
+        std::process::exit(1);
+    }
+    proxy_socket
+}
+
 /// Run with full network access (current behavior).
-fn run_passthrough(home: &str, tmp_dir: &str, args: &[String], masked: &[PathBuf]) -> i32 {
-    let mut cmd = build_bwrap_cmd(home, tmp_dir, BwrapNetMode::Passthrough, masked);
+fn run_passthrough(
+    home: &str,
+    tmp_dir: &str,
+    args: &[String],
+    masked: &[PathBuf],
+    docker_sock: Option<&Path>,
+) -> i32 {
+    let mut cmd = build_bwrap_cmd(
+        home,
+        tmp_dir,
+        BwrapNetMode::Passthrough,
+        masked,
+        docker_sock,
+    );
     cmd.args(args);
     exec_bwrap(cmd)
 }
 
 /// Run with no network access at all.
-fn run_isolated(home: &str, tmp_dir: &str, args: &[String], masked: &[PathBuf]) -> i32 {
-    let mut cmd = build_bwrap_cmd(home, tmp_dir, BwrapNetMode::Isolated, masked);
+fn run_isolated(
+    home: &str,
+    tmp_dir: &str,
+    args: &[String],
+    masked: &[PathBuf],
+    docker_sock: Option<&Path>,
+) -> i32 {
+    let mut cmd = build_bwrap_cmd(home, tmp_dir, BwrapNetMode::Isolated, masked, docker_sock);
     cmd.args(args);
     exec_bwrap(cmd)
 }
@@ -85,6 +176,7 @@ fn run_filtered(
     entries: Vec<AllowEntry>,
     cli_entries: Vec<AllowEntry>,
     masked: Vec<PathBuf>,
+    docker_sock: Option<&Path>,
 ) -> i32 {
     let mut whitelist = Whitelist::new(entries);
 
@@ -107,6 +199,7 @@ fn run_filtered(
     let resolv_clone = resolv_path.clone();
     let args_clone = args.to_vec();
     let masked_clone = masked.clone();
+    let docker_sock_clone = docker_sock.map(PathBuf::from);
 
     let sandbox = netns::setup_sandbox_netns_with_child(move || {
         // This runs in the child process, inside the new user+net namespace.
@@ -116,6 +209,7 @@ fn run_filtered(
             &tmp_dir_clone,
             BwrapNetMode::Filtered,
             &masked_clone,
+            docker_sock_clone.as_deref(),
         );
 
         // Override the real resolv.conf file (following symlinks)
@@ -160,6 +254,7 @@ fn build_bwrap_cmd(
     tmp_dir: &str,
     net_mode: BwrapNetMode,
     masked: &[PathBuf],
+    docker_sock: Option<&Path>,
 ) -> Command {
     let mut cmd = Command::new("bwrap");
 
@@ -189,7 +284,15 @@ fn build_bwrap_cmd(
     cmd.args(["--bind", tmp_dir, "/tmp"]);
 
     // System paths (read-only)
-    for path in ["/nix/store", "/run", "/etc", "/bin", "/usr/bin", "/lib", "/lib64"] {
+    for path in [
+        "/nix/store",
+        "/run",
+        "/etc",
+        "/bin",
+        "/usr/bin",
+        "/lib",
+        "/lib64",
+    ] {
         if std::fs::metadata(path).is_ok() {
             cmd.args(["--ro-bind", path, path]);
         }
@@ -260,6 +363,16 @@ fn build_bwrap_cmd(
         if let Some(p) = path.to_str() {
             cmd.args(["--ro-bind", "/dev/null", p]);
         }
+    }
+
+    // Overlay the filtering docker proxy socket at /run/docker.sock so
+    // docker clients with default settings find it, and point the env
+    // var at the same path for good measure.
+    if let Some(sock) = docker_sock
+        && let Some(p) = sock.to_str()
+    {
+        cmd.args(["--ro-bind", p, "/run/docker.sock"]);
+        cmd.args(["--setenv", "DOCKER_HOST", "unix:///run/docker.sock"]);
     }
 
     cmd
