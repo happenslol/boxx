@@ -189,7 +189,7 @@ fn build_bwrap_cmd(
     cmd.args(["--bind", tmp_dir, "/tmp"]);
 
     // System paths (read-only)
-    for path in ["/nix/store", "/run", "/etc"] {
+    for path in ["/nix/store", "/run", "/etc", "/bin", "/usr/bin"] {
         if std::fs::metadata(path).is_ok() {
             cmd.args(["--ro-bind", path, path]);
         }
