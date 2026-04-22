@@ -321,9 +321,9 @@ pub fn run_proxy(
             && let Some((dst_ip, dst_port)) = extract_tcp_syn(frame)
             && whitelist.is_ip_allowed(dst_ip)
         {
-            let has_listener = listening_ports.get(&dst_port).is_some_and(|&h| {
-                sockets.get::<tcp::Socket>(h).state() == tcp::State::Listen
-            });
+            let has_listener = listening_ports
+                .get(&dst_port)
+                .is_some_and(|&h| sockets.get::<tcp::Socket>(h).state() == tcp::State::Listen);
             if !has_listener {
                 let rx_buf = tcp::SocketBuffer::new(vec![0u8; 65535]);
                 let tx_buf = tcp::SocketBuffer::new(vec![0u8; 65535]);

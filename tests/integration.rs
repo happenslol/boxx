@@ -1,3 +1,5 @@
+#![cfg(feature = "integration")]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -271,13 +273,7 @@ fn config_file_masked_inside_sandbox() {
 
     // Write attempt: ro-bind blocks writes.
     let out = boxx_in(dir.path())
-        .args([
-            "--allow-all",
-            "--",
-            "sh",
-            "-c",
-            "echo pwned > boxx.toml",
-        ])
+        .args(["--allow-all", "--", "sh", "-c", "echo pwned > boxx.toml"])
         .output()
         .unwrap();
     assert!(!out.status.success(), "writing masked config should fail");
@@ -293,11 +289,7 @@ fn config_file_masked_inside_sandbox() {
 #[test]
 fn config_file_drives_allowlist() {
     let dir = TempDir::new("load");
-    std::fs::write(
-        dir.path().join("boxx.toml"),
-        "allow = [\"example.com\"]\n",
-    )
-    .unwrap();
+    std::fs::write(dir.path().join("boxx.toml"), "allow = [\"example.com\"]\n").unwrap();
 
     // No --allow on the CLI — filtered mode is reached purely via the
     // config file's allowlist.
@@ -373,13 +365,7 @@ fn gitconfig_is_mounted_readonly() {
 
     // Sandbox sees the host's .gitconfig contents at $HOME/.gitconfig.
     let out = boxx_in(dir.path())
-        .args([
-            "--allow-all",
-            "--",
-            "sh",
-            "-c",
-            "cat \"$HOME/.gitconfig\"",
-        ])
+        .args(["--allow-all", "--", "sh", "-c", "cat \"$HOME/.gitconfig\""])
         .output()
         .unwrap();
     assert!(

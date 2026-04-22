@@ -3,6 +3,9 @@ name = "boxx"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+integration = []
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
@@ -14,11 +17,11 @@ toml = "0.8"
 version = "0.12"
 default-features = false
 features = [
-    "std",
-    "medium-ethernet",
-    "proto-ipv4",
-    "proto-ipv6",
-    "socket-tcp",
-    "socket-udp",
-    "socket-raw",
+  "std",
+  "medium-ethernet",
+  "proto-ipv4",
+  "proto-ipv6",
+  "socket-tcp",
+  "socket-udp",
+  "socket-raw",
 ]

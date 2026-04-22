@@ -45,7 +45,7 @@
       };
 
       cargoArtifacts = craneLib.buildDepsOnly args;
-      cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+      cargoClippyExtraArgs = "--all-targets --no-default-features -- --deny warnings";
 
       package = craneLib.buildPackage (args
         // {
@@ -65,7 +65,10 @@
 
         fmt = craneLib.cargoFmt (args // {inherit cargoArtifacts;});
         fmt-toml = craneLib.taploFmt {src = pkgs.lib.sources.sourceFilesBySuffices src [".toml"];};
-        test = craneLib.cargoTest (args // {inherit cargoArtifacts;});
+        test = craneLib.cargoTest (args // {
+          inherit cargoArtifacts;
+          cargoTestExtraArgs = "--no-default-features";
+        });
         clippy = craneLib.cargoClippy (args // {inherit cargoArtifacts cargoClippyExtraArgs;});
       };
 

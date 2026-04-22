@@ -5,7 +5,7 @@ mod proxy;
 mod whitelist;
 
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 use whitelist::{AllowEntry, Whitelist, parse_allow_entry};
@@ -30,8 +30,7 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    let cli_entries: Vec<AllowEntry> =
-        cli.allow.iter().map(|s| parse_allow_entry(s)).collect();
+    let cli_entries: Vec<AllowEntry> = cli.allow.iter().map(|s| parse_allow_entry(s)).collect();
 
     // Snapshot which config files exist at startup. This set is the
     // only source the watcher reads from, and the only set we overlay
@@ -39,11 +38,7 @@ fn main() {
     // mid-run are never loaded.
     let config_paths = config::existing_config_paths();
     let config_entries = config::load(&config_paths).to_allow_entries();
-    let all_entries: Vec<AllowEntry> = cli_entries
-        .iter()
-        .cloned()
-        .chain(config_entries)
-        .collect();
+    let all_entries: Vec<AllowEntry> = cli_entries.iter().cloned().chain(config_entries).collect();
 
     let home = std::env::var("HOME").expect("HOME not set");
     let tmp_dir = format!("/tmp/boxx-{:016x}", random_u64());
@@ -227,9 +222,19 @@ fn build_bwrap_cmd(
 
     // Current working directory (read-write, overlays the ro-bind above)
     if let Ok(ref cwd) = cwd {
-        let cwd = cwd.to_str().expect("cwd is not valid utf-8");
-        cmd.args(["--bind", cwd, cwd]);
-        cmd.args(["--chdir", cwd]);
+        let cwd_str = cwd.to_str().expect("cwd is not valid utf-8");
+        cmd.args(["--bind", cwd_str, cwd_str]);
+        cmd.args(["--chdir", cwd_str]);
+
+        // If cwd is a git worktree, the main repo's `.git` directory lives
+        // elsewhere on disk and git operations need read-write access to it
+        // (refs, packed-refs, objects). Mount only `.git`, not the rest of
+        // the main worktree, to keep sandbox access minimal.
+        if let Some(common_git) = worktree_common_git_dir(cwd)
+            && let Some(p) = common_git.to_str()
+        {
+            cmd.args(["--bind", p, p]);
+        }
     }
 
     // Home files (read-only). Must come after the cwd bind above so that
@@ -264,6 +269,31 @@ fn exec_bwrap_replace(mut cmd: Command) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     // This only returns if exec fails
     cmd.exec()
+}
+
+/// If `cwd` is inside a git worktree, return the absolute path to the main
+/// repository's `.git` directory. Returns `None` for regular checkouts (where
+/// `.git` is itself the directory) or if the worktree metadata can't be read.
+fn worktree_common_git_dir(cwd: &Path) -> Option<PathBuf> {
+    let dot_git = cwd.join(".git");
+    if !std::fs::metadata(&dot_git).ok()?.is_file() {
+        return None;
+    }
+    let contents = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = contents.lines().find_map(|l| l.strip_prefix("gitdir:"))?;
+    let worktree_gitdir = PathBuf::from(gitdir.trim());
+
+    // The worktree's gitdir contains a `commondir` file pointing to the
+    // main repo's `.git` directory (relative to the worktree gitdir, or
+    // absolute).
+    let commondir = std::fs::read_to_string(worktree_gitdir.join("commondir")).ok()?;
+    let commondir = commondir.trim();
+    let main_git = if Path::new(commondir).is_absolute() {
+        PathBuf::from(commondir)
+    } else {
+        worktree_gitdir.join(commondir)
+    };
+    main_git.canonicalize().ok()
 }
 
 fn random_u64() -> u64 {
