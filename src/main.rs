@@ -213,7 +213,7 @@ fn build_bwrap_cmd(
     }
 
     // Home subset (read-write)
-    for dir in [".local", ".cache", ".pi"] {
+    for dir in [".local", ".cache", ".pi", ".pnpm-store"] {
         let path = format!("{home}/{dir}");
         if std::fs::metadata(&path).is_ok() {
             cmd.args(["--bind", &path, &path]);
