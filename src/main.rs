@@ -189,10 +189,17 @@ fn build_bwrap_cmd(
     cmd.args(["--bind", tmp_dir, "/tmp"]);
 
     // System paths (read-only)
-    for path in ["/nix/store", "/run", "/etc", "/bin", "/usr/bin"] {
+    for path in ["/nix/store", "/run", "/etc", "/bin", "/usr/bin", "/lib", "/lib64"] {
         if std::fs::metadata(path).is_ok() {
             cmd.args(["--ro-bind", path, path]);
         }
+    }
+
+    // Per-user runtime directory (read-only)
+    let uid = unsafe { libc::getuid() };
+    let run_user = format!("/run/user/{uid}");
+    if std::fs::metadata(&run_user).is_ok() {
+        cmd.args(["--ro-bind", &run_user, &run_user]);
     }
 
     let cwd =
@@ -239,9 +246,11 @@ fn build_bwrap_cmd(
 
     // Home files (read-only). Must come after the cwd bind above so that
     // when cwd == home the file ro-bind still overlays the rw bind.
-    let gitconfig = format!("{home}/.gitconfig");
-    if std::fs::metadata(&gitconfig).is_ok() {
-        cmd.args(["--ro-bind", &gitconfig, &gitconfig]);
+    for file in [".gitconfig", ".zshrc"] {
+        let path = format!("{home}/{file}");
+        if std::fs::metadata(&path).is_ok() {
+            cmd.args(["--ro-bind", &path, &path]);
+        }
     }
 
     // Mask config files — sandbox sees an empty read-only file at each
