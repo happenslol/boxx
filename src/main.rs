@@ -309,7 +309,7 @@ fn build_bwrap_cmd(
         std::env::current_dir().map(|c| c.canonicalize().expect("failed to canonicalize cwd"));
 
     // Home subset (read-only), skip if cwd is inside
-    for dir in ["code", ".config", ".flake"] {
+    for dir in ["code", ".config", ".flake", ".supermaven"] {
         let path = std::path::PathBuf::from(format!("{home}/{dir}"))
             .canonicalize()
             .unwrap_or_else(|_| std::path::PathBuf::from(format!("{home}/{dir}")));
