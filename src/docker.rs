@@ -28,14 +28,12 @@ const PIPE_BUF: usize = 16 * 1024;
 /// Shown verbatim (via the daemon error envelope) to anything that
 /// hits an attach path — `docker run` without `-d`, `docker attach`,
 /// `docker start -a`. Written so an agent reading stderr can act on it.
-const ATTACH_HINT: &str =
-    "foreground attach is blocked. run detached and read output separately: \
+const ATTACH_HINT: &str = "foreground attach is blocked. run detached and read output separately: \
      `docker run -d IMAGE CMD` (capture the id), then \
      `docker wait <id>` + `docker logs <id>`";
 
 /// Analogous hint for `docker exec` / `docker attach <id>`.
-const EXEC_HINT: &str =
-    "exec is blocked. start a fresh container with the command you want \
+const EXEC_HINT: &str = "exec is blocked. start a fresh container with the command you want \
      (`docker run -d IMAGE CMD`), or bake it into a new image";
 
 /// Configuration for the proxy.
@@ -422,9 +420,15 @@ fn decide_create(req: &Request, state: &State) -> Decision {
 }
 
 fn wants_foreground_attach(obj: &serde_json::Map<String, Value>) -> bool {
-    ["AttachStdin", "AttachStdout", "AttachStderr", "OpenStdin", "Tty"]
-        .iter()
-        .any(|k| obj.get(*k).and_then(Value::as_bool).unwrap_or(false))
+    [
+        "AttachStdin",
+        "AttachStdout",
+        "AttachStderr",
+        "OpenStdin",
+        "Tty",
+    ]
+    .iter()
+    .any(|k| obj.get(*k).and_then(Value::as_bool).unwrap_or(false))
 }
 
 fn inject_label(obj: &mut serde_json::Map<String, Value>, sandbox_id: &str) {
@@ -1045,7 +1049,13 @@ mod tests {
             .unwrap();
         assert!(!wants_foreground_attach(&m));
 
-        for flag in ["AttachStdin", "AttachStdout", "AttachStderr", "Tty", "OpenStdin"] {
+        for flag in [
+            "AttachStdin",
+            "AttachStdout",
+            "AttachStderr",
+            "Tty",
+            "OpenStdin",
+        ] {
             let m: serde_json::Map<_, _> = serde_json::json!({flag: true})
                 .as_object()
                 .cloned()

@@ -19,9 +19,12 @@ struct Cli {
     #[arg(long = "allow", value_name = "DOMAIN|IP|CIDR")]
     allow: Vec<String>,
 
-    /// Allow unrestricted network access (passthrough).
-    #[arg(long = "allow-all")]
-    allow_all: bool,
+    /// Enable the network proxy. Without --proxy, the sandbox has
+    /// full network access (default). With --proxy, all outbound
+    /// traffic is blocked unless explicitly allowed via --allow
+    /// entries or boxx.toml.
+    #[arg(long = "proxy")]
+    proxy: bool,
 
     /// Expose a filtered docker socket to the sandbox. Uses the rootless
     /// daemon at `$XDG_RUNTIME_DIR/docker.sock` (or `docker_socket` in
@@ -62,30 +65,34 @@ fn main() {
         .then(|| setup_docker_proxy(&tmp_dir, config.docker_socket.clone()));
     let docker_sock_ref = docker_sock.as_deref();
 
-    let exit_code = if cli.allow_all {
+    let exit_code = if cli.proxy {
+        if !all_entries.is_empty() {
+            run_filtered(
+                &home,
+                &tmp_dir,
+                &cli.command,
+                all_entries,
+                cli_entries,
+                config_paths,
+                docker_sock_ref,
+            )
+        } else {
+            // --proxy with no allow entries: all network blocked.
+            run_isolated(
+                &home,
+                &tmp_dir,
+                &cli.command,
+                &config_paths,
+                docker_sock_ref,
+            )
+        }
+    } else {
+        // Default: full network access, no proxy or filtering.
         run_passthrough(
             &home,
             &tmp_dir,
             &cli.command,
             &config_paths,
-            docker_sock_ref,
-        )
-    } else if all_entries.is_empty() {
-        run_isolated(
-            &home,
-            &tmp_dir,
-            &cli.command,
-            &config_paths,
-            docker_sock_ref,
-        )
-    } else {
-        run_filtered(
-            &home,
-            &tmp_dir,
-            &cli.command,
-            all_entries,
-            cli_entries,
-            config_paths,
             docker_sock_ref,
         )
     };
@@ -136,7 +143,7 @@ fn setup_docker_proxy(tmp_dir: &str, configured_backend: Option<PathBuf>) -> Pat
     proxy_socket
 }
 
-/// Run with full network access (current behavior).
+/// Run with full network access (default).
 fn run_passthrough(
     home: &str,
     tmp_dir: &str,
@@ -155,7 +162,7 @@ fn run_passthrough(
     exec_bwrap(cmd)
 }
 
-/// Run with no network access at all.
+/// Run with no network access at all (--proxy with no --allow entries).
 fn run_isolated(
     home: &str,
     tmp_dir: &str,
@@ -241,9 +248,9 @@ fn run_filtered(
 }
 
 enum BwrapNetMode {
-    /// Full passthrough: --unshare-all --share-net
+    /// Full passthrough: --unshare-all --share-net (default)
     Passthrough,
-    /// Isolated: --unshare-all (network unshared by bwrap)
+    /// Isolated: --unshare-all (--proxy with no allow entries)
     Isolated,
     /// Filtered: already in user+net namespace, only unshare ipc/pid/uts/cgroup
     Filtered,

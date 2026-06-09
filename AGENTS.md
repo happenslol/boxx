@@ -90,7 +90,11 @@ boxx <command> [args...]
 
 ## Security Model
 
-- Uses all Linux namespaces (`--unshare-all`) except network (`--share-net`)
+- Uses all Linux namespaces (`--unshare-all`) except network (`--share-net`) by default
+- Network is **not filtered by default** — commands have full network access
+- Filtering proxy is **opt-in** via `--proxy`; when active, all outbound traffic
+  is blocked unless explicitly allowed via `--allow` entries or `boxx.toml`
+- `--proxy` with no `--allow` entries blocks all network access
 - Filesystem is mostly read-only to prevent sandbox escape via file writes
 - Current working directory is writable for practical file operations
 - Temporary directory is per-invocation to prevent cross-execution data leakage
